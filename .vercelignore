@@ -1,0 +1,21 @@
+# Files the Vercel CLI must never upload (it does not read .gitignore patterns).
+# The deployment is configured through Vercel environment variables instead.
+
+# Private environment files; the example file stays.
+.env
+.env.*
+!.env.example
+
+# Keys and certificates.
+*.pem
+*.key
+
+# Task specification (kept locally only).
+docs/
+
+# Test results, local build output and dependencies (rebuilt on Vercel).
+test-results/
+coverage/
+.next/
+node_modules/
+*.tsbuildinfo

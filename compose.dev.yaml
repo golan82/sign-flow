@@ -1,0 +1,34 @@
+# LOCAL DEVELOPMENT ONLY: MongoDB for running Next.js and the worker directly
+# on Windows (npm run dev / npm run worker:claims). Use it through the npm
+# scripts (npm run db:up, db:stop) or `docker compose -f compose.dev.yaml ...`.
+# Not a production configuration: no authentication, single replica set
+# member, port bound to 127.0.0.1. The full Docker run is docker-compose.yml,
+# a separate Compose project with its own volumes.
+name: sign-flow
+
+services:
+  mongodb:
+    image: mongo:8.0.38
+    # Prisma's MongoDB connector requires a replica set (it uses transactions).
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      # Host-only. The replica set member is advertised as 127.0.0.1:27017,
+      # so the host and container ports must stay identical.
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - ./docker/mongodb/replica-set.js:/docker/replica-set.js:ro
+    healthcheck:
+      # Initiates the replica set on first run (idempotent) and reports
+      # healthy only once this node is PRIMARY.
+      test: ["CMD", "mongosh", "--quiet", "--port", "27017", "--file", "/docker/replica-set.js"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+      start_interval: 1s
+
+volumes:
+  mongodb_data:
+  mongodb_config:

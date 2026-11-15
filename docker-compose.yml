@@ -1,0 +1,102 @@
+# Full local run of SignFlow in Docker: MongoDB (replica set), a one-shot
+# schema step, the Next.js app and the claim-expiry worker.
+#
+#   docker compose up -d --build --wait      (needs UPLOAD_SIGNING_SECRET, see README)
+#   open http://127.0.0.1:3080
+#
+# LOCAL DEMO CONFIGURATION, NOT A SECURE PUBLIC DEPLOYMENT: MongoDB has no
+# authentication (it is reachable only inside the Compose network), there is
+# no TLS, and the app is published on 127.0.0.1 only.
+#
+# This is a separate Compose project from local development
+# (compose.dev.yaml, project "sign-flow"): it has its own network and
+# volumes, and its replica set member is advertised as mongodb:27017.
+name: signflow
+
+x-database-url: &database-url mongodb://mongodb:27017/signflow?replicaSet=rs0
+
+services:
+  mongodb:
+    image: mongo:8.0.38
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    environment:
+      # Address drivers switch to after replica set discovery; reachable from
+      # app and worker on the Compose network.
+      MONGO_REPLICA_HOST: mongodb:27017
+    # No published port: only app, worker and schema talk to MongoDB.
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - ./docker/mongodb/replica-set.js:/docker/replica-set.js:ro
+    healthcheck:
+      # Initiates the replica set on first run and is healthy only when PRIMARY.
+      test: ["CMD", "mongosh", "--quiet", "--port", "27017", "--file", "/docker/replica-set.js"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+
+  # Applies prisma/schema.prisma (unique and lookup indexes) and exits.
+  # Safe to run on every start: db push only adds what is missing.
+  schema:
+    build:
+      context: .
+      target: schema
+    environment:
+      DATABASE_URL: *database-url
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      target: app
+    environment:
+      DATABASE_URL: *database-url
+      # Injected at run time from your environment or .env; never baked into the image.
+      UPLOAD_SIGNING_SECRET: ${UPLOAD_SIGNING_SECRET:?Set UPLOAD_SIGNING_SECRET (at least 32 characters) - see README "Run with Docker"}
+    ports:
+      - "127.0.0.1:${APP_PORT:-3080}:3000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      schema:
+        condition: service_completed_successfully
+    healthcheck:
+      # Ready when the API answers, which also proves the database connection.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/orders').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+    stop_grace_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: worker
+    environment:
+      DATABASE_URL: *database-url
+      CLAIM_SWEEP_INTERVAL_MS: ${CLAIM_SWEEP_INTERVAL_MS:-5000}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      schema:
+        condition: service_completed_successfully
+    # The worker finishes its current sweep on SIGTERM, then exits.
+    stop_grace_period: 15s
+    restart: unless-stopped
+
+volumes:
+  mongodb_data:
+  mongodb_config:

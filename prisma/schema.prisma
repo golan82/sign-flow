@@ -1,0 +1,116 @@
+// Prisma ORM 6.19 (MongoDB). Schema changes are applied with `prisma db push`;
+// `prisma migrate` is not supported for MongoDB.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// Keep in sync with ORDER_STATUSES in src/lib/orders/status.ts
+// (a compile-time check in src/lib/orders/service.ts enforces this).
+enum OrderStatus {
+  DRAFT
+  SUBMITTED
+  VENDOR_ACCEPTED
+  IN_PRODUCTION
+  READY_FOR_INSTALL
+  COMPLETED
+  CANCELLED
+}
+
+// Installer claim lifecycle. Keep in sync with CLAIM_STATES in
+// src/lib/claims/claims.ts (checked at compile time in src/lib/claims/service.ts).
+enum ClaimState {
+  NONE
+  PENDING_VERIFICATION
+  CONFIRMED
+}
+
+model Order {
+  id          String      @id @default(auto()) @map("_id") @db.ObjectId
+  title       String
+  description String?
+  status      OrderStatus @default(DRAFT)
+  // Optimistic concurrency token: incremented on every status, vendor or claim change.
+  version     Int         @default(0)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  // Assigned demo vendor (src/lib/vendors/vendors.ts). Optional: older
+  // documents have no vendor. Required before VENDOR_ACCEPTED.
+  vendorId    String?
+
+  // Installer claim. All optional: documents written before claims existed
+  // have none of these fields, and a missing/null claimState means NONE.
+  // Claim writes go through conditional raw updates in src/lib/claims/store.mts.
+  claimState       ClaimState? @default(NONE)
+  claimInstallerId String?
+  // SHA-256 of the claim token; the token itself is never stored.
+  claimTokenHash   String?
+  // Source of truth for expiry of PENDING_VERIFICATION claims.
+  claimExpiresAt   DateTime?
+  claimedAt        DateTime?
+  claimConfirmedAt DateTime?
+
+  // clientRequestIds of the upload attempts that hold a place under
+  // MAX_UPLOAD_ATTEMPTS_PER_ORDER (src/lib/demo-limits.mts). Missing means none.
+  // Written only by the conditional raw update in src/lib/uploads/service.ts;
+  // not part of the public DTO.
+  uploadRequestIds String[]
+
+  // Supports the dashboard list order (newest first, _id as tie-breaker).
+  @@index([createdAt(sort: Desc), id(sort: Desc)])
+  // Finds expired pending claims for the expiry worker.
+  @@index([claimState, claimExpiresAt])
+  @@map("orders")
+}
+
+// Lifecycle of one upload attempt (see src/lib/uploads). An attempt that is
+// still PENDING_UPLOAD after authorizationExpiresAt is treated as expired.
+enum UploadStatus {
+  PENDING_UPLOAD
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+// Metadata of a print file attached to an order. The file content is never
+// stored in MongoDB; in this project the storage itself is simulated.
+model Upload {
+  id                     String       @id @default(auto()) @map("_id") @db.ObjectId
+  orderId                String       @db.ObjectId
+  originalName           String
+  // BSON int64: files can exceed 2 GiB.
+  sizeBytes              BigInt
+  contentType            String
+  // Server-generated object key; never derived from the file name.
+  storageKey             String       @unique
+  status                 UploadStatus @default(PENDING_UPLOAD)
+  // Client-chosen id of one "start upload" action; makes authorization
+  // requests idempotent (a double click returns the same attempt).
+  clientRequestId        String
+  // The signed upload URL is valid until this instant.
+  authorizationExpiresAt DateTime
+  completedAt            DateTime?
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+
+  @@unique([orderId, clientRequestId])
+  @@index([orderId, createdAt(sort: Desc)])
+  @@map("uploads")
+}
+
+// Serializes the demo order limit (MAX_DEMO_ORDERS in src/lib/demo-limits.mts).
+// Every order creation writes the document with id "orders" inside its
+// transaction, so concurrent creations conflict and retry one at a time, and
+// the order count read in that transaction cannot be stale.
+model DemoLimit {
+  id  String @id @map("_id")
+  seq Int    @default(0)
+
+  @@map("demo_limits")
+}

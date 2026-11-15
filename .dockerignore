@@ -1,0 +1,33 @@
+# Secrets and local environment: never part of the build context.
+.env
+.env.*
+*.pem
+
+# Installed / generated output (rebuilt inside the image).
+node_modules
+.next
+out
+build
+coverage
+test-results
+*.tsbuildinfo
+next-env.d.ts
+
+# VCS, editors, OS files.
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+desktop.ini
+npm-debug.log*
+
+# Not needed to build or run.
+docs
+README.md
+AGENTS.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+compose.dev.yaml
