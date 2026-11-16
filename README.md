@@ -1,215 +1,149 @@
 # SignFlow
 
-לוח בקרה לניהול הזמנות שילוט בהתאמה אישית: מחזור חיים של הזמנה, שיוך ספקים,
-תפיסת עבודות התקנה על ידי מתקינים, קבצי הדפסה ועדכונים חיים בין חלונות.
+SignFlow is a dashboard for managing custom signage orders. Orders move through a server-enforced status lifecycle, vendors are assigned, and installers claim ready jobs with exactly one winner per job. A claim must pass a simulated verification within three minutes or it expires. Print files go through a simulated direct-to-cloud upload with signed URLs, and every open window stays in sync through MongoDB Change Streams and Server-Sent Events.
 
-> זוהי **מטלת בית להדגמה**, לא מערכת מוכנה לייצור. אימות הזהות והתשלום
-> ואחסון הקבצים הם **הדמיות**. המתקינים והספקים הם רשימה קבועה של נתוני דמו
-> ללא התחברות, ולכן אינם הרשאות: כל מי שיכול לפתוח את האתר יכול לשנות את נתוני
-> ההדגמה.
+> This is a take-home **demonstration**, not a production system. Identity and payment verification and file storage are **simulated**. Installers and vendors are fixed demo identities without login, so anyone who can open the app can change the demo data.
 
-## יכולות מרכזיות
+## Table of Contents
 
-- **הזמנות עם מחזור סטטוסים שנאכף בשרת ובממשק**:
-  `DRAFT -> SUBMITTED -> VENDOR_ACCEPTED -> IN_PRODUCTION -> READY_FOR_INSTALL -> COMPLETED`,
-  וביטול (`CANCELLED`) רק לפני `IN_PRODUCTION`. מעבר לא חוקי מחזיר `400`.
-- **שיוך ספק** מתוך רשימת ספקי דמו. ספק נדרש לפני `VENDOR_ACCEPTED` וננעל לאחר מכן.
-- **תפיסת עבודת התקנה**: כשכמה מתקינים תופסים את אותה הזמנה בו־זמנית, בדיוק
-  אחד מצליח (נעילה אופטימית במסד). התפיסה ממתינה לאימות מדומה ופוקעת
-  אוטומטית לאחר 3 דקות.
-- **העלאת קבצי הדפסה מדומה** ישירות לאחסון, באמצעות כתובות חתומות מראש
-  (pre-signed URLs), כולל קובץ דמו של 1.5 GB, התקדמות, ביטול, כשל וניסיון חוזר.
-- **עדכונים חיים** בכל החלונות הפתוחים: MongoDB Change Streams דוחפים
-  שינויים דרך Server-Sent Events, ללא תשאול חוזר של המסד.
-- **חלוניות** ליצירת הזמנה, שינוי סטטוס, שיוך ספק, שיוך מתקין וקבצי הדפסה.
-  הממשק רספונסיבי (טלפון, טאבלט, מחשב).
+- [Live Demo](#live-demo)
+- [Quick Start with Docker](#quick-start-with-docker)
+- [Architecture and Tech Stack](#architecture-and-tech-stack)
+- [Core Design](#core-design): [schema](#database-schema), [lifecycle](#order-lifecycle), [atomic writes](#conditional-atomic-writes), [claim expiry](#three-minute-claim-expiry), [uploads](#simulated-direct-to-cloud-upload), [live updates](#live-updates-without-polling)
+- [Testing](#testing)
+- [Demo Limitations](#demo-limitations)
+- [Documentation](#documentation)
 
-## הדגמה חיה
+## Live Demo
 
 **https://sign-flow-flame.vercel.app**
 
-- האתר מוגן ב־Vercel Authentication. ללא הרשאה, גם הדף וגם ה־API מפנים
-  להתחברות Vercel.
-- **קישור הגישה לבודק נמסר בנפרד** ואינו נשמר במאגר. הוראות הגישה מפורטות
-  ב־[docs/deployment.md](docs/deployment.md).
-- הנתונים משותפים לכל מי שמחזיק בקישור. לבדיקת עדכונים חיים ותפיסות מקבילות,
-  פתחו את האתר בשני חלונות ובחרו מתקין שונה בכל חלון (**Acting as installer**).
+- The deployment is protected by Vercel Authentication. **The reviewer access link is provided separately** and is not stored in this repository.
+- Open the link in a private window and use a second window in the same browser to see live updates; pick a different installer in each window (**Acting as installer**). The data is shared by everyone with the link. Access steps, hosting (Vercel Hobby with a Vercel Daemon, MongoDB Atlas) and cloud check results: [docs/deployment.md](docs/deployment.md).
 
-## הרצה ב־Docker (Run with Docker)
+## Quick Start with Docker
 
-נדרש **Docker** עם Compose v2 בלבד (Docker Desktop ב־Windows/macOS, או Docker
-Engine עם תוסף compose ב־Linux). אין צורך ב־Node.js.
+### Run with Docker
 
-1. יצירת קובץ `.env` עם סוד חתימה אקראי (נוצר בתוך קונטיינר):
+**Prerequisites:** Docker with Compose v2 (Docker Desktop, or Docker Engine with the Compose plugin); Node.js is not needed. From the repository root, create `.env` with a random upload-signing secret (generated inside a container; this overwrites an existing `.env`), then build and start MongoDB, the schema setup, the app and the expiry worker. `--wait` returns once the app is healthy; the first build takes about 2 to 3 minutes.
 
-   ```sh
-   # Linux/macOS (bash/zsh)
-   echo "UPLOAD_SIGNING_SECRET=$(docker run --rm node:24.14.0-bookworm-slim node -e "process.stdout.write(require('crypto').randomBytes(32).toString('base64url'))")" > .env
-   ```
-
-   ```powershell
-   # Windows PowerShell
-   $secret = docker run --rm node:24.14.0-bookworm-slim node -e "process.stdout.write(require('crypto').randomBytes(32).toString('base64url'))"
-   Set-Content -Path .env -Value "UPLOAD_SIGNING_SECRET=$secret" -Encoding ascii
-   ```
-
-2. בנייה והפעלה. הפקודה חוזרת כשהאפליקציה תקינה (בנייה ראשונה כ־2 עד 3 דקות):
-
-   ```sh
-   docker compose up -d --build --wait
-   ```
-
-3. פתיחת לוח הבקרה: http://127.0.0.1:3080
-
-אם פורט 3080 תפוס, הוסיפו `APP_PORT=<port>` לקובץ `.env`. ה־worker לפקיעת
-תפיסות כבר רץ. הפעלה מחדש: `docker compose up -d --wait`. עצירה עם שמירת
-הנתונים: `docker compose stop` או `docker compose down`.
-
-> **אזהרה:** `docker compose down -v` מוחק את ה־volumes של הפרויקט ואיתם את
-> **כל הנתונים** של הרצת ה־Docker.
-
-השירותים: `mongodb` (replica set בצומת יחיד, ללא פורט חיצוני), `schema`
-(הרצה חד־פעמית של `prisma db push`), `app` (שרת Next.js, על `127.0.0.1` בלבד)
-ו־`worker` (פקיעת תפיסות). זו תצורה מקומית להדגמה: ל־MongoDB אין סיסמה ואין
-TLS. פירוט נוסף ב־[docs/development-and-testing.md](docs/development-and-testing.md).
-
-## טכנולוגיות
-
-| רכיב | גרסה |
-| --- | --- |
-| Next.js (App Router), React | 16.4.6, 19.3.1 |
-| TypeScript (strict) | 5.9.3 |
-| Tailwind CSS, shadcn/ui | 4.3.5, רכיבים שנוצרו ב־CLI 4.23.0 |
-| Prisma (MongoDB connector) | 6.19.3 |
-| MongoDB, דרייבר `mongodb` | 8.0.38 (replica set), 7.8.0 |
-| Zod, Vitest | 4.6.7, 5.1.0 |
-| Node.js | 24.14.0 (`engines`: `^22.18.0 \|\| ^24.0.0 \|\| >=26.0.0`) |
-
-Prisma 6 ולא 7: ל־Prisma 7 אין connector ל־MongoDB. נימוקי הגרסאות מפורטים
-ב־[docs/development-and-testing.md](docs/development-and-testing.md).
-
-## החלטות ארכיטקטורה מרכזיות
-
-- **כל הבקשות עוברות דרך Next.js API routes** (`src/app/api/orders/**/route.ts`):
-  הזמנות, סטטוסים, ספקים, תפיסות ואימות, והרשאות העלאה. הלוגיקה העסקית נמצאת
-  ב־`src/lib/*/service.ts`.
-- **עיבוד האירועים החיים רץ בשרת Next.js**: נתיב ה־SSE (`/api/orders/events`)
-  מוזן מ־change stream אחד לכל תהליך שרת, ומגיב לכתיבות מכל תהליך.
-- **כל שינוי מצב הוא כתיבה מותנית אחת** ב־MongoDB, כך שהבדיקה והשינוי אטומיים.
-  אין Redis ואין נעילה בזיכרון.
-- **השעון הוא של MongoDB** (`$$NOW`), כך ששרתים ותהליכים עם סטיית שעון אינם
-  חלוקים על הפקיעה.
-- **worker נפרד לפקיעת תפיסות** (`scripts/claim-expiry-worker.mts`): הוא רק
-  מאפס את שדות התפיסה שפקעו. הפקיעה עצמה נאכפת ב־API, גם כשה־worker עצור.
-  זו פרשנות מכוונת של דרישת המשימה להריץ עיבוד אירועים ב־API routes.
-- **הדפים אינם תלויים במסד בזמן הבנייה**: הדף הוא מעטפת סטטית, והנתונים
-  נטענים בדפדפן (`GET` ראשוני ואחריו SSE).
-
-פירוט מלא, כולל דיאגרמות, טבלת ה־API וקודי השגיאה:
-[docs/architecture.md](docs/architecture.md).
-
-## סכמת המסד (תקציר)
-
-הסכמה ב־`prisma/schema.prisma`. שינויי סכמה מוחלים ב־`prisma db push`.
-
-| אוסף | תוכן | אינדקסים |
-| --- | --- | --- |
-| `orders` | `title`, `description`, `status`, `version`, `vendorId`, שדות התפיסה (`claimState`, `claimInstallerId`, `claimTokenHash`, `claimExpiresAt`, `claimedAt`, `claimConfirmedAt`), `uploadRequestIds`, `createdAt`, `updatedAt` | `{ createdAt: -1, _id: -1 }`, `{ claimState: 1, claimExpiresAt: 1 }` |
-| `uploads` | מטא־דאטה בלבד של קבצי הדפסה: `orderId`, `originalName`, `sizeBytes`, `contentType`, `storageKey`, `status`, `clientRequestId`, `authorizationExpiresAt`, `completedAt` | ייחודי `storageKey`, ייחודי `(orderId, clientRequestId)`, `(orderId, createdAt desc)` |
-| `demo_limits` | מסמך אחד (`_id: "orders"`) שמסדר את מגבלת ההזמנות | |
-
-- `version` עולה בכל שינוי סטטוס, ספק או תפיסה.
-- אסימון התפיסה עצמו לעולם אינו נשמר, רק ה־SHA-256 שלו (`claimTokenHash`).
-- תוכן קבצים לעולם אינו נשמר ב־MongoDB.
-- כל שדות התפיסה אופציונליים, ולכן מסמכים ישנים נקראים ללא מיגרציה.
-
-## נעילה אופטימית ותפיסת עבודה
-
-- **שינוי סטטוס וספק**: הלקוח שולח `expectedVersion`. השרת מבצע עדכון מותנה
-  אחד עם הסינון `{ _id, status, version: expectedVersion }`. אם בקשה אחרת
-  הקדימה, אף מסמך לא מתאים והתשובה היא `409 VERSION_CONFLICT`.
-- **תפיסה**: עדכון מותנה אחד שמצליח רק אם ההזמנה `READY_FOR_INSTALL` והתפיסה
-  פנויה (`claimState` חסר או `NONE`, או `PENDING_VERIFICATION` שפקעה). בתפיסות
-  מקבילות בדיוק אחת מקבלת `201` עם אסימון, והשאר `409 CLAIM_UNAVAILABLE`.
-- **אימות מדומה**: `PASSED` מאשר את התפיסה (`CONFIRMED`), `FAILED` משחרר אותה
-  מיד. שתיהן מותנות באותו מתקין, באותו אסימון ובכך שהתפיסה טרם פקעה.
-- נבדק באינטגרציה עם 2 ו־12 תפיסות מקבילות, ובבדיקת ממשק בשני חלונות.
-
-## פקיעת תפיסה
-
-- תפיסה ממתינה לאימות פוקעת לאחר **3 דקות** (`claimExpiresAt`, לפי שעון MongoDB).
-- מרגע הפקיעה התפיסה נחשבת פנויה, ואימות מאוחר נדחה ב־`409 CLAIM_EXPIRED`.
-  זה נאכף בכתיבה המותנית עצמה, ולכן אינו תלוי ב־worker.
-- ה־worker סורק כל 5 שניות תפיסות שפקעו (דרך האינדקס) ומשחרר כל אחת בעדכון
-  מותנה. השינוי מגיע לכל החלונות דרך ה־change stream. כמה workers יכולים לרוץ
-  במקביל.
-- תפיסה מאושרת (`CONFIRMED`) לעולם אינה פוקעת.
-
-## צינור ההעלאה המדומה
-
-1. הדפדפן מבקש הרשאה: `POST /api/orders/{id}/uploads` עם `clientRequestId`, שם,
-   גודל וסוג.
-2. השרת יוצר רשומת `Upload` במצב `PENDING_UPLOAD` ומחזיר כתובת חתומה
-   (HMAC-SHA256 עם `UPLOAD_SIGNING_SECRET`), שתקפה ל־30 דקות.
-3. הדפדפן "מעלה" לאחסון מדומה. ההתקדמות מקומית לחלון המעלה בלבד, ואין כתיבה
-   למסד בכל אחוז.
-4. בסיום, ביטול או כשל, הדפדפן שולח את הכתובת החתומה ל־`.../complete` או
-   ל־`.../abort`. השרת מאמת את החתימה ומבצע עדכון מותנה ל־`COMPLETED`,
-   ל־`CANCELLED` או ל־`FAILED`.
-5. ה־change stream מעדכן את שאר החלונות בסטטוס (מטא־דאטה בלבד).
-
-אין העברת קבצים בפועל: הכתובת מפנה ל־`https://simulated-storage.invalid`. ההרשאה
-אידמפוטנטית לפי `clientRequestId`, וגודל הקובץ מוגבל ל־5 GiB. ההסבר כיצד אחסון
-אמיתי (S3, GCS, Azure Blob) יחליף את ההדמיה נמצא ב־[docs/architecture.md](docs/architecture.md).
-
-## בדיקות
-
-```powershell
-npm.cmd run check               # typecheck, lint, build
-npm.cmd test                    # בדיקות יחידה (ללא מסד)
-npm.cmd run db:up               # MongoDB מקומי, נדרש לבדיקות הבאות
-npm.cmd run test:integration    # API, תפיסות, העלאות, מגבלות ו־SSE מול signflow_test
-npm.cmd run build; npm.cmd run test:ui   # בדיקת ממשק בשני חלונות דפדפן (Edge/Chrome)
+```sh
+# Linux / macOS
+echo "UPLOAD_SIGNING_SECRET=$(docker run --rm node:24.14.0-bookworm-slim node -e "process.stdout.write(require('crypto').randomBytes(32).toString('base64url'))")" > .env
+docker compose up -d --build --wait
 ```
 
-ב־macOS/Linux משתמשים ב־`npm` במקום `npm.cmd`. הבדיקות כותבות רק למסד
-`signflow_test`, ומוחקות רק את הרשומות שיצרו.
+```powershell
+# Windows PowerShell
+$secret = docker run --rm node:24.14.0-bookworm-slim node -e "process.stdout.write(require('crypto').randomBytes(32).toString('base64url'))"
+Set-Content -Path .env -Value "UPLOAD_SIGNING_SECRET=$secret" -Encoding ascii
+docker compose up -d --build --wait
+```
 
-התיעוד מבחין בין סוגי הבדיקות:
+Open **http://127.0.0.1:3080**. Stop without deleting data with `docker compose stop`, and start again with `docker compose up -d --wait` (`docker compose down -v` would delete all data of the Docker run). If port 3080 is taken, add `APP_PORT=<port>` to `.env`. Troubleshooting, local development and Docker internals: [docs/development-and-testing.md](docs/development-and-testing.md#troubleshooting).
 
-- **בדיקות אוטומטיות**: יחידה, אינטגרציה ובדיקת הממשק.
-- **בדיקות ידניות מקומיות**, כולל רוחב טאבלט.
-- **בדיקה מקומית ב־Docker**.
-- **בדיקה ידנית בענן**.
-- **אימות הגדרות בלבד**.
+## Architecture and Tech Stack
 
-הפירוט והתוצאות ב־[docs/development-and-testing.md](docs/development-and-testing.md),
-ותוצאות בדיקת הענן ב־[docs/deployment.md](docs/deployment.md).
+```mermaid
+flowchart TB
+    Browser["Browser (dashboard)"] -- "HTTP requests" --> API["Next.js API routes<br/>/api/orders/**"]
+    API -- "conditional writes" --> DB[("MongoDB replica set")]
+    Worker["Claim-expiry worker<br/>(separate process)"] -- "release expired claims" --> DB
+    DB -- "Change Streams" --> SSE["Next.js SSE endpoint<br/>/api/orders/events"]
+    SSE -- "Server-Sent Events" --> Browser
+```
 
-## מגבלות ההדגמה
+API routes handle every request (business logic in `src/lib/*/service.ts`), live event processing runs in the Next.js server through one Change Stream per server process, and a separate worker only cleans up expired claims; expiry itself is enforced by the API.
 
-- **אין התחברות והרשאות**: מתקינים וספקים הם זהויות דמו שנבחרות בדפדפן.
-- **תקרות נתונים**: עד **200 הזמנות** במסד, ועד **20 ניסיונות העלאה להזמנה**
-  (כולל ניסיונות שנכשלו או בוטלו). חריגה מחזירה `409 DEMO_LIMIT_REACHED` עם
-  הודעה בחלונית.
-- **הגבלת קצב (WAF) בפריסה**: 30 בקשות `POST`/`PATCH` ב־60 שניות לכל IP,
-  בנתיבים שמתחילים ב־`/api/orders`. חריגה מחזירה `429`. הכלל אינו מגביל בקשות
-  `GET` וחיבורי SSE.
-- **התקרות וכלל ה־WAF אינם מבטיחים מניעת מיצוי מכסות** של Vercel ו־Atlas
-  (זמן פונקציות, זיכרון, תעבורה, פעולות במסד).
-- **זרם ה־SSE מתחדש כל 280 שניות** (מגבלת 300 שניות לפונקציה ב־Vercel Hobby),
-  ללא הצגת "Reconnecting...".
-- **ה־worker בענן** רץ כ־Vercel Daemon (בטא), שמכסתו החודשית מספיקה לכ־17 ימי
-  ריצה רצופה. גם אחריהם הפקיעה נאכפת ב־API.
-- **הדמיות**: אימות זהות ותשלום (כפתורי דמו), ואחסון קבצים.
-
-## תיעוד מפורט
-
-| מסמך | תוכן |
+| Area | Technology |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | רכיבים, מודל הנתונים, כללי הסטטוס, ה־API וקודי השגיאה, נעילה ותפיסות, worker, העלאות, עדכונים חיים, ממשק, מגבלות ההדגמה וכיסוי דרישות המשימה |
-| [docs/development-and-testing.md](docs/development-and-testing.md) | פיתוח מקומי, פרטי Docker, משתני סביבה, מסד הבדיקות, פקודות ותוצאות הבדיקות, תרחיש הדגמה, תלויות ומבנה הפרויקט |
-| [docs/deployment.md](docs/deployment.md) | הפריסה ב־Vercel וב־MongoDB Atlas, גישת הבודק, הגנת גישה, WAF, מכסות, תוצאות בדיקת הענן ונוהל הכיבוי |
+| Framework and UI | Next.js 16 (App Router), React 19, TypeScript 5 (strict), Tailwind CSS 4, shadcn/ui |
+| Data and live updates | MongoDB 8 (replica set), Prisma 6 (MongoDB connector; Prisma 7 has none), Change Streams via the `mongodb` driver 7, Server-Sent Events |
+| Validation and tests | Zod 4, Vitest 5, two-window browser check over the Chrome DevTools Protocol |
+| Runtime | Node.js 24, Docker Compose; Vercel and MongoDB Atlas for the live demo |
 
-מסמך המשימה המקורי נשמר מקומית בלבד, ומוחרג מהמאגר (`.gitignore`), מ־Vercel
-(`.vercelignore`) ומ־Docker (`.dockerignore`).
+## Core Design
+
+The task requires documentation of the schema, the locking strategy and the upload pipeline; each is summarized here, with full detail in [docs/architecture.md](docs/architecture.md).
+
+### Database Schema
+
+| Collection | Purpose | Key fields |
+| --- | --- | --- |
+| `orders` (`Order`) | one signage order | `title`, `description`, `status`, `version`, `vendorId`, claim fields (`claimState`, `claimInstallerId`, `claimTokenHash`, `claimExpiresAt`, `claimedAt`, `claimConfirmedAt`), `uploadRequestIds` |
+| `uploads` (`Upload`) | metadata of one upload attempt | `orderId`, `originalName`, `sizeBytes`, `contentType`, `storageKey`, `status`, `clientRequestId`, `authorizationExpiresAt` |
+| `demo_limits` (`DemoLimit`) | coordination only: serializes order creation for the 200-order limit | `_id: "orders"`, `seq` |
+
+`version` increases on every status, vendor or claim change. Only the SHA-256 hash of a claim token is stored, and file content is never stored. Key indexes: `{ claimState, claimExpiresAt }` for expiry scans and unique `(orderId, clientRequestId)` for idempotent uploads.
+
+### Order Lifecycle
+
+`DRAFT -> SUBMITTED -> VENDOR_ACCEPTED -> IN_PRODUCTION -> READY_FOR_INSTALL -> COMPLETED`, and `CANCELLED` only from `DRAFT`, `SUBMITTED` or `VENDOR_ACCEPTED` (before `IN_PRODUCTION`). No skipping, going back or same-status transitions; `COMPLETED` and `CANCELLED` are final, and a vendor is required for `VENDOR_ACCEPTED`. One module (`src/lib/orders/status.ts`) drives both the server check (`400 INVALID_TRANSITION`) and the actions offered in the UI.
+
+### Conditional Atomic Writes
+
+The task's "optimistic database locking" option, with no Redis or in-memory locks: every state change is **one conditional MongoDB update** whose filter holds all preconditions, so check and write are atomic. All time conditions use MongoDB's clock (`$$NOW`), so servers with clock skew cannot disagree.
+
+- **Status and vendor changes** filter on `{ _id, status, version: expectedVersion }`; a concurrent change makes the update match nothing, and the API answers `409 VERSION_CONFLICT`.
+- **Claims (no double booking)** succeed only if the order is `READY_FOR_INSTALL` and the claim is free or expired. Of several simultaneous claims, exactly one gets `201` with a claim token; the others get `409 CLAIM_UNAVAILABLE`.
+- **Simulated verification:** `PASSED` confirms and `FAILED` releases the claim; both require the same installer and token and an unexpired claim.
+
+### Three-Minute Claim Expiry
+
+- A pending claim expires **180 seconds** after it was made (`claimExpiresAt`). **The API enforces it:** an expired claim counts as free inside the conditional write, and a late verification gets `409 CLAIM_EXPIRED`, even when the worker is stopped.
+- **The worker cleans up:** `scripts/claim-expiry-worker.mts` scans every 5 seconds through the expiry index and releases each expired claim with a conditional update; the change reaches every window through the Change Stream. Several workers can run safely, and a `CONFIRMED` claim never expires.
+
+### Simulated Direct-to-Cloud Upload
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant API as Next.js API
+    participant DB as MongoDB
+    B->>API: POST /api/orders/{id}/uploads (name, size, type, clientRequestId)
+    API->>DB: create Upload (PENDING_UPLOAD)
+    API-->>B: signed upload URL (valid 30 min)
+    Note over B: simulated PUT, progress shown locally only
+    B->>API: POST .../complete or .../abort with the signed URL
+    API->>DB: verify signature, conditional update to final status
+    DB-->>API: change stream event
+    API-->>B: SSE snapshot with the status (other windows)
+```
+
+- **Signed authorization:** HMAC-SHA256 with the server-only `UPLOAD_SIGNING_SECRET` over the upload, order, server-generated `storageKey`, exact size, content type and expiry; a modified or foreign URL gets `403 UPLOAD_SIGNATURE_INVALID`.
+- **Local progress, stored metadata:** progress stays in the uploading window with no database write per percent; only the upload record and its final status (`COMPLETED`, `CANCELLED`, `FAILED`) are stored and pushed to other windows. Authorization is idempotent per `clientRequestId`, files can be up to 5 GiB, and no bytes are sent (the URL points to `https://simulated-storage.invalid`).
+
+### Live Updates without Polling
+
+- `GET /api/orders/events` streams `snapshot` and `heartbeat` events. One Change Stream per server process watches `orders` and `uploads`; a change triggers one re-read of the public order list, pushed to every client. Nothing reads the database on a timer, and upload progress never touches it.
+- Each stream ends after 280 seconds (below Vercel's 300-second limit) with a `reconnect` event; the client reconnects at once and stays **Live**. After a stream failure, missed changes are replayed from the last resume token.
+
+## Testing
+
+```sh
+npm run check              # typecheck, lint and production build
+npm test                   # unit tests (no database)
+npm run test:integration   # after npm run db:up: API, claims, uploads, demo limits, SSE (signflow_test)
+npm run test:ui            # two-window browser check (needs MongoDB, Edge or Chrome, and a build)
+```
+
+On Windows PowerShell use `npm.cmd`. Unit tests cover the status rules, schemas, URL signing, the storage adapter and client merging; integration tests cover concurrent claims, version conflicts, expiry, uploads, demo limits and SSE against a dedicated test database; the UI check runs the main flows in two browser windows at phone and desktop width.
+
+**Results in brief:** the last full automated run passed (87 unit, 117 integration, 23 UI checks), and the final Docker check of the current `main` passed 34 of 34. The production deployment was checked manually; simultaneous claims and an actual `429` were not tested in the cloud, and the WAF rule is verified as configuration only. Details, including what was not checked: [docs/development-and-testing.md](docs/development-and-testing.md#test-results) and [docs/deployment.md](docs/deployment.md#cloud-check-results).
+
+## Demo Limitations
+
+- **No login or permissions:** installers and vendors are demo identities chosen in the browser. Identity and payment verification (demo buttons) and file storage are simulated.
+- **Data limits:** at most **200 orders** and **20 upload attempts per order** (failed and cancelled ones included); beyond them, `409 DEMO_LIMIT_REACHED` is shown in the dialog.
+- **Rate limit in the deployment (Vercel WAF):** 30 `POST`/`PATCH` requests per 60 seconds per IP on paths starting with `/api/orders`, answered with `429`. It does not limit `GET` requests or SSE connections.
+- **Quotas:** the data limits and the WAF rule do not guarantee that Vercel or Atlas free-plan quotas cannot be exhausted. The worker's Vercel Daemon (beta) quota covers about 17 days of continuous running; expiry is still enforced by the API afterwards.
+
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | components, full data model, status rules, API and error codes, locking and claims, worker, uploads, live updates, UI, demo limits, task requirement coverage |
+| [docs/development-and-testing.md](docs/development-and-testing.md) | local development, Docker details, troubleshooting, environment variables, test database, test commands and results, demo walkthrough, dependencies, project structure |
+| [docs/deployment.md](docs/deployment.md) | Vercel and Atlas setup, reviewer access, access protection, WAF, quotas, cloud check results, shutdown procedure |
+
+The original task specification is kept locally only and is excluded from Git, Vercel and Docker.

@@ -1,486 +1,539 @@
-# ארכיטקטורה
+# Architecture
 
-מסמך זה מפרט את מבנה המערכת. לתקציר ולהוראות ההרצה ראו את
-[README](../README.md).
+This document describes how the system is built. For the summary and the
+quick start, see the [README](../README.md).
 
-## רכיבים
+## Components
 
 ```mermaid
 flowchart LR
-    B[דפדפן] -- "בקשות API" --> API[Next.js API routes]
+    B[Browser] -- "API requests" --> API[Next.js API routes]
     B -- "SSE" --> EV["/api/orders/events"]
     API --> DB[(MongoDB replica set)]
-    W[worker לפקיעת תפיסות] --> DB
+    W[Claim-expiry worker] --> DB
     DB -- "change stream" --> EV
 ```
 
-- **API routes** (`src/app/api/orders/**/route.ts`) מטפלים בכל בקשה: הזמנות,
-  שינויי סטטוס, שיוך ספקים, תפיסות ואימות, והרשאה, השלמה וביטול של העלאות.
-  ה־route מאמת קלט עם Zod וממפה תוצאות ל־HTTP. הלוגיקה העסקית נמצאת
-  ב־`src/lib/orders/service.ts`, ב־`src/lib/claims/service.ts`
-  וב־`src/lib/uploads/service.ts`. הכתיבות המותנות של התפיסות נמצאות
-  ב־`src/lib/claims/store.mts`.
-- **עיבוד האירועים החיים רץ גם הוא בשרת Next.js**: נתיב ה־SSE
-  (`/api/orders/events`) מוזן מ־change stream אחד לכל תהליך שרת
-  (`src/lib/realtime/order-feed.ts`). הוא מגיב לכתיבות מכל תהליך, ולעולם אינו
-  מתשאל את המסד בלולאה.
-- **ה־worker לפקיעת תפיסות** (`scripts/claim-expiry-worker.mts`, השירות
-  `worker` ב־Docker וה־daemon ב־Vercel) הוא תהליך תחזוקה נפרד. הוא רק מאפס את
-  השדות השמורים של תפיסות שפקעו, והשינוי מגיע לכל הלקוחות דרך ה־change stream.
+- **API routes** (`src/app/api/orders/**/route.ts`) handle every request:
+  orders, status changes, vendor assignment, installer claims and
+  verification, and upload authorization, completion and cancellation. Route
+  handlers validate input with Zod and map results to HTTP. Business logic is
+  in `src/lib/orders/service.ts`, `src/lib/claims/service.ts` and
+  `src/lib/uploads/service.ts`. The conditional claim writes are in
+  `src/lib/claims/store.mts`.
+- **Live event processing also runs in the Next.js server.** The SSE route
+  (`/api/orders/events`) is fed by one MongoDB change stream per server
+  process (`src/lib/realtime/order-feed.ts`). It reacts to writes from any
+  process and never polls the database.
+- **The claim-expiry worker** (`scripts/claim-expiry-worker.mts`; the
+  `worker` service in Docker and the daemon on Vercel) is a separate
+  maintenance process. It only resets the stored fields of claims whose
+  expiry has passed, and the change reaches every client through the change
+  stream.
 
-### למה ה־worker נפרד, ולמה הפקיעה אינה תלויה בו
+### Why the worker is separate, and why expiry does not depend on it
 
-המשימה מבקשת שה־API ועיבוד האירועים ירוצו ב־Next.js API routes. **פקיעת
-התפיסה נאכפת ב־API routes, לא ב־worker**: כתיבות התפיסה והאימות מותנות בשעון
-של MongoDB. תפיסה ממתינה שפקעה כבר נחשבת פנויה לתפיסה, ואימות של תפיסה שפקעה
-נדחה (`409 CLAIM_EXPIRED`). אם ה־worker עצור, הפקיעה עדיין חלה, ורק ניקוי
-השדות השמורים מתעכב.
+The task asks for the backend API and event processing in Next.js API routes.
+**Claim expiry is enforced by the API routes, not by the worker.** The claim
+and verification writes are conditional on MongoDB's clock: an expired
+pending claim already counts as free to claim, and a verification for an
+expired claim is rejected (`409 CLAIM_EXPIRED`). If the worker is stopped,
+expiry still applies; only the cleanup of the stored fields is delayed.
 
-ה־worker נפרד מפני שלמטפל בבקשה אין מקום אמין לטיימר. `setTimeout` לכל תפיסה
-אובד בהפעלה מחדש ומשוכפל בין מופעים, ואינדקס TTL היה מוחק את ההזמנה. הרצת
-הסריקה בתוך בקשות HTTP הייתה קושרת את הניקוי לתעבורה. כמה workers יכולים
-לרוץ במקביל, כי כל שחרור הוא עדכון מותנה. זו פרשנות מכוונת של נוסח המשימה,
-ולא התאמה מילולית.
+The worker is a separate process because a request handler has no reliable
+place for a timer: a per-claim `setTimeout` is lost on restart and duplicated
+across instances, and a TTL index would delete the order. Running the sweep
+inside HTTP requests would tie cleanup to traffic. Several workers may run at
+once, because each release is a conditional update. This is a deliberate
+reading of the task's wording, not a literal match.
 
-## מודל הנתונים
+## Data Model
 
-`prisma/schema.prisma`.
+Defined in `prisma/schema.prisma`.
 
-### האוסף `orders`
+### Collection `orders`
 
-| שדה | סוג | הערות |
+| Field | Type | Notes |
 | --- | --- | --- |
 | `id` | ObjectId (`_id`) | |
-| `title` | string | חובה, ללא רווחים בקצוות, 1 עד 120 תווים |
-| `description` | string, אופציונלי | ללא רווחים בקצוות, עד 2,000 תווים. ערך ריק נשמר כחסר |
-| `status` | enum `OrderStatus` | ברירת מחדל `DRAFT` |
-| `version` | int | ברירת מחדל `0`. עולה בכל שינוי סטטוס, ספק **או תפיסה** |
-| `createdAt` | DateTime | ברירת מחדל: עכשיו |
-| `updatedAt` | DateTime | מתעדכן בכל כתיבה |
-| `vendorId` | string, אופציונלי | מזהה ספק דמו (`src/lib/vendors/vendors.ts`). חסר או null: אין ספק |
-| `claimState` | enum `ClaimState`, אופציונלי | `NONE` / `PENDING_VERIFICATION` / `CONFIRMED`. חסר או null פירושו `NONE` |
-| `claimInstallerId` | string, אופציונלי | מזהה מתקין הדמו של התפיסה הנוכחית |
-| `claimTokenHash` | string, אופציונלי | SHA-256 של אסימון התפיסה. האסימון עצמו לעולם אינו נשמר |
-| `claimExpiresAt` | DateTime, אופציונלי | מועד הפקיעה של תפיסה ממתינה. **מקור האמת לפקיעה** |
-| `claimedAt` | DateTime, אופציונלי | מועד התפיסה הנוכחית |
-| `claimConfirmedAt` | DateTime, אופציונלי | מועד שבו האימות עבר |
-| `uploadRequestIds` | רשימת strings | ה־`clientRequestId` של ניסיונות ההעלאה שתופסים מקום במגבלת ההדגמה. חסר: אין. לעולם אינו מוחזר ב־API |
+| `title` | string | required, trimmed, 1 to 120 characters |
+| `description` | string, optional | trimmed, up to 2,000 characters; blank is stored as missing |
+| `status` | `OrderStatus` enum | default `DRAFT` |
+| `version` | int | default `0`; incremented on every status, vendor **or claim** change |
+| `createdAt` | DateTime | default now |
+| `updatedAt` | DateTime | updated on every write |
+| `vendorId` | string, optional | demo vendor id (`src/lib/vendors/vendors.ts`); missing or null means no vendor |
+| `claimState` | `ClaimState` enum, optional | `NONE` / `PENDING_VERIFICATION` / `CONFIRMED`; missing or null means `NONE` |
+| `claimInstallerId` | string, optional | demo installer id of the current claim |
+| `claimTokenHash` | string, optional | SHA-256 of the claim token; the token itself is never stored |
+| `claimExpiresAt` | DateTime, optional | expiry of a pending claim; **the source of truth for expiry** |
+| `claimedAt` | DateTime, optional | when the current claim was made |
+| `claimConfirmedAt` | DateTime, optional | when verification passed |
+| `uploadRequestIds` | string list | `clientRequestId`s of the upload attempts that hold a place under the per-order demo limit; missing means none; never returned by the API |
 
-אינדקסים: `{ createdAt: -1, _id: -1 }` (סדר הרשימה) ו־
-`{ claimState: 1, claimExpiresAt: 1 }` (איתור תפיסות ממתינות שפקעו).
+Indexes: `{ createdAt: -1, _id: -1 }` (list order) and
+`{ claimState: 1, claimExpiresAt: 1 }` (finding expired pending claims).
 
-**מסמכים קיימים.** כל שדות התפיסה אופציונליים בכוונה: מסמכים שנכתבו לפני
-שהתפיסות נוספו אינם מכילים אותם, ו־Prisma אינו יכול לקרוא מסמך שחסר בו שדה
-חובה. הקוד מתייחס ל־`claimState` חסר או null כאל `NONE` (ה־API ממפה אותו,
-והכתיבות המותנות משתמשות ב־`$ifNull`), ולכן לא נדרשת מיגרציה. `db push` רק
-מוסיף את האינדקס. בדיקה מכניסה מסמך ללא שדות תפיסה ותופסת אותו.
+**Existing documents.** All claim fields are optional on purpose: documents
+written before claims existed have none of them, and Prisma cannot read a
+document that lacks a required field. The code treats a missing or null
+`claimState` as `NONE` (the API maps it, and the conditional writes use
+`$ifNull`), so no migration is required; `db push` only adds the index. A
+test inserts a document without claim fields and claims it.
 
-הנחות: המשימה אינה מגדירה שדות הזמנה נוספים (לקוח, מידות, מחיר), ולכן לא
-נוספו. הספקים הם רשימה קבועה של שלושה ספקי דמו שנשמרים לפי מזהה, ואין אוסף
-ספקים.
+Assumptions: the task does not define other order fields (customer,
+dimensions, price), so none were added. Vendors are a fixed list of three
+demo vendors stored by id; there is no vendor collection.
 
-### האוסף `uploads`
+### Collection `uploads`
 
-המודל `Upload` שומר מטא־דאטה של קבצי הדפסה. **תוכן קבצים לעולם אינו נשמר
-ב־MongoDB.**
+The `Upload` model stores print-file metadata. **File content is never
+stored in MongoDB.**
 
-| שדה | סוג | הערות |
+| Field | Type | Notes |
 | --- | --- | --- |
-| `id` | ObjectId (`_id`) | נוצר בשרת לפני כתיבת הרשומה |
-| `orderId` | ObjectId | ההזמנה (נבדק שהיא קיימת, ללא קשר Prisma) |
-| `originalName` | string | שם לתצוגה בלבד, 1 עד 200 תווים, ללא מפרידי נתיב ותווי בקרה |
-| `sizeBytes` | int64 | מבית אחד עד 5 GiB |
-| `contentType` | string | פורמט הדפסה מרשימה מותרת. הסיומת חייבת להתאים |
-| `storageKey` | string, ייחודי | `orders/<orderId>/<uploadId>/<random>.<ext>`. נוצר בשרת, לעולם אינו שם הקובץ |
-| `status` | enum `UploadStatus` | `PENDING_UPLOAD` ואחריו `COMPLETED`, `CANCELLED` או `FAILED` |
-| `clientRequestId` | string | ייחודי להזמנה. הופך את ההרשאה לאידמפוטנטית |
-| `authorizationExpiresAt` | DateTime | תוקף הכתובת החתומה (30 דקות). `PENDING_UPLOAD` אחריו מוצג כפג תוקף |
-| `completedAt` | DateTime, אופציונלי | |
+| `id` | ObjectId (`_id`) | generated by the server before the record is written |
+| `orderId` | ObjectId | the order (checked to exist; no Prisma relation) |
+| `originalName` | string | display name only, 1 to 200 characters, no path separators or control characters |
+| `sizeBytes` | int64 | 1 byte to 5 GiB |
+| `contentType` | string | allow-listed print format; the extension must match |
+| `storageKey` | string, unique | `orders/<orderId>/<uploadId>/<random>.<ext>`; server-generated, never the file name |
+| `status` | `UploadStatus` enum | `PENDING_UPLOAD`, then `COMPLETED`, `CANCELLED` or `FAILED` |
+| `clientRequestId` | string | unique per order; makes authorization idempotent |
+| `authorizationExpiresAt` | DateTime | validity of the signed URL (30 minutes); a `PENDING_UPLOAD` after it is shown as expired |
+| `completedAt` | DateTime, optional | |
 | `createdAt`, `updatedAt` | DateTime | |
 
-אינדקסים: ייחודי `storageKey`, ייחודי `(orderId, clientRequestId)`,
+Indexes: unique `storageKey`, unique `(orderId, clientRequestId)`,
 `(orderId, createdAt desc)`.
 
-### האוסף `demo_limits`
+### Collection `demo_limits`
 
-המודל `DemoLimit`: מסמך אחד, `{ _id: "orders", seq }`, שכל יצירת הזמנה כותבת
-אליו כדי לסדר את [מגבלת ההזמנות](#מגבלות-ההדגמה). הוא אינו מכיל נתוני
-הזמנות.
+The `DemoLimit` model: one document, `{ _id: "orders", seq }`, written by
+every order creation to serialize the [order limit](#demo-limitations). It
+holds no order data.
 
-## כללי הסטטוס
+## Status Rules
 
 ```
 DRAFT -> SUBMITTED -> VENDOR_ACCEPTED -> IN_PRODUCTION -> READY_FOR_INSTALL -> COMPLETED
 DRAFT | SUBMITTED | VENDOR_ACCEPTED -> CANCELLED
 ```
 
-- אין דילוג, אין חזרה אחורה ואין מעבר לאותו סטטוס.
-- `CANCELLED` רק לפני `IN_PRODUCTION`.
-- `COMPLETED` ו־`CANCELLED` סופיים.
+- No skipping, no moving backwards and no same-status transitions.
+- `CANCELLED` only before `IN_PRODUCTION`.
+- `COMPLETED` and `CANCELLED` are final.
 
-הכללים נמצאים ב־`src/lib/orders/status.ts`, שאין לו תלויות בשרת. השרת משתמש
-בו כדי לאכוף מעברים, והממשק משתמש בו כדי להציג רק את הפעולות המותרות.
+The rules live in `src/lib/orders/status.ts`, which has no server
+dependencies. The server uses it to enforce transitions; the UI uses it to
+show only the allowed actions.
 
-**כלל הספק.** המעבר `SUBMITTED -> VENDOR_ACCEPTED` דורש ספק משויך
-(`400 VENDOR_REQUIRED`). אפשר לשייך, להחליף או להסיר ספק רק כל עוד ההזמנה
-`DRAFT` או `SUBMITTED` (אחר כך `400 VENDOR_LOCKED`), עם אותה בדיקת התנגשות
-`expectedVersion` כמו בשינויי סטטוס. כל שינוי ספק מעלה את `version`, וכתיבת
-הסטטוס מותנית ב־`version`, ולכן הזמנה לעולם אינה מגיעה ל־`VENDOR_ACCEPTED`
-ללא ספק, גם כשהסרה ואישור מתרחשים במקביל (נבדק).
+**Vendor rule.** `SUBMITTED -> VENDOR_ACCEPTED` requires an assigned vendor
+(`400 VENDOR_REQUIRED`). The vendor can be assigned, changed or removed only
+while the order is `DRAFT` or `SUBMITTED` (`400 VENDOR_LOCKED` afterwards),
+with the same `expectedVersion` conflict check as status changes. Because
+every vendor change bumps `version` and the status write is conditional on
+`version`, an order can never reach `VENDOR_ACCEPTED` without a vendor, even
+when removal and acceptance race (tested).
 
-**השלמה אינה תלויה בתפיסה או בהעלאות.** המשימה אינה דורשת מתקין מאושר או
-קובץ שהועלה לפני `READY_FOR_INSTALL -> COMPLETED`. כשהזמנה מושלמת, תפיסה
-**ממתינה** משתחררת באותה כתיבה אטומית (היא כבר לא תוכל להיות מאושרת), ותפיסה
-**מאושרת** נשמרת כתיעוד של המתקין שהוקצה. השלמה ואישור בו־זמניים הם שתי
-כתיבות מותנות על אותו מסמך, ולכן מתרחש בדיוק סדר אירועים אחד (נבדק).
+**Completion does not depend on the claim or uploads.** The task does not
+require a confirmed installer or an uploaded file before
+`READY_FOR_INSTALL -> COMPLETED`. When an order is completed, a still
+**pending** claim is released in the same atomic write (it could never be
+confirmed any more); a **confirmed** claim is kept as the record of the
+assigned installer. Completion and a simultaneous confirmation are both
+conditional writes on the same document, so exactly one order of events
+happens (tested).
 
-החלטות בנקודות שהמשימה משאירה פתוחות: השלמה אינה קשורה לתפיסה מאושרת או
-להעלאה, מתקין יכול להחזיק כמה עבודות, וספק נדרש ל־`VENDOR_ACCEPTED` וננעל
-לאחר מכן.
+Decisions on points the task leaves open: completion is not tied to a
+confirmed claim or an upload; an installer may hold several jobs; a vendor is
+required for `VENDOR_ACCEPTED` and locked afterwards.
 
 ## API
 
-כל התשובות הן JSON עם `Cache-Control: no-store` (זרם ה־SSE הוא
-`text/event-stream`). מבנה השגיאה:
+All responses are JSON with `Cache-Control: no-store` (the SSE stream is
+`text/event-stream`). Errors have the shape
 `{ "error": { "code": "...", "message": "...", "issues": [...]? } }`.
 
-| שיטה ונתיב | גוף הבקשה | הצלחה |
+| Method and path | Body | Success |
 | --- | --- | --- |
-| `GET /api/orders` | אין | `200 { orders, serverTime }`, מהחדשה לישנה. `serverTime` הוא שעון MongoDB |
+| `GET /api/orders` | none | `200 { orders, serverTime }`, newest first; `serverTime` is the MongoDB clock |
 | `POST /api/orders` | `{ title, description? }` | `201 { order }`, `DRAFT`, version `0` |
 | `PATCH /api/orders/[id]/status` | `{ targetStatus, expectedVersion }` | `200 { order }` |
 | `PATCH /api/orders/[id]/vendor` | `{ vendorId: "<demo vendor id>" \| null, expectedVersion }` | `200 { order }` |
 | `POST /api/orders/[id]/claim` | `{ installerId }` | `201 { order, claimToken }` |
 | `POST /api/orders/[id]/claim/verification` | `{ installerId, claimToken, outcome: "PASSED" \| "FAILED" }` | `200 { order }` |
-| `POST /api/orders/[id]/uploads` | `{ clientRequestId, originalName, sizeBytes, contentType }` | `201 { upload, uploadUrl, expiresAt }` (`200` כשאותו `clientRequestId` חוזר) |
-| `POST /api/orders/[id]/uploads/[uploadId]/complete` | `{ uploadUrl }` | `200 { upload, changed }` (אידמפוטנטי) |
-| `POST /api/orders/[id]/uploads/[uploadId]/abort` | `{ uploadUrl, reason: "CANCELLED" \| "FAILED" }` | `200 { upload, changed }` (אידמפוטנטי) |
-| `GET /api/orders/events` | אין | SSE: אירועי `snapshot` (`{ orders, serverTime }`), `heartbeat` (`{ serverTime }`), ולפני שהשרת סוגר את הזרם (אחרי 280 שניות) `reconnect` |
+| `POST /api/orders/[id]/uploads` | `{ clientRequestId, originalName, sizeBytes, contentType }` | `201 { upload, uploadUrl, expiresAt }` (`200` when the same `clientRequestId` is repeated) |
+| `POST /api/orders/[id]/uploads/[uploadId]/complete` | `{ uploadUrl }` | `200 { upload, changed }` (idempotent) |
+| `POST /api/orders/[id]/uploads/[uploadId]/abort` | `{ uploadUrl, reason: "CANCELLED" \| "FAILED" }` | `200 { upload, changed }` (idempotent) |
+| `GET /api/orders/events` | none | SSE: `snapshot` (`{ orders, serverTime }`), `heartbeat` (`{ serverTime }`) and, before the server ends the stream (after 280 s), `reconnect` |
 
-`order.vendorId` הוא מזהה ספק דמו או `null`. `order.claim` הוא
-`{ state, installerId, expiresAt, claimedAt, confirmedAt }`. `order.uploads` היא
-רשימה של `{ id, originalName, sizeBytes, contentType, status, createdAt,
+`order.vendorId` is a demo vendor id or `null`. `order.claim` is
+`{ state, installerId, expiresAt, claimedAt, confirmedAt }`. `order.uploads`
+is a list of `{ id, originalName, sizeBytes, contentType, status, createdAt,
 updatedAt, expiresAt, completedAt }`.
 
-אסימון התפיסה מופיע **רק** בתשובה ל־`POST .../claim`, והכתובת החתומה **רק**
-בתשובה ל־`POST .../uploads`. הם לעולם אינם מופיעים ב־`GET /api/orders`,
-בתשובות אחרות או בזרם ה־SSE, וכך גם גיבובי אסימונים, `storageKey`
-ו־`clientRequestId`. אין נקודת קצה שמקבלת תוכן קבצים.
+The claim token appears **only** in the `POST .../claim` response, and the
+signed upload URL **only** in the `POST .../uploads` response. Neither
+appears in `GET /api/orders`, other responses or the SSE stream, and neither
+do token hashes, `storageKey` or `clientRequestId`. There is no endpoint
+that accepts file content.
 
-| סטטוס | קוד | מתי |
+| Status | Code | When |
 | --- | --- | --- |
-| 400 | `INVALID_JSON` | הגוף אינו JSON תקין |
-| 400 | `VALIDATION_ERROR` | מזהה לא תקין, שדות חסרים, לא תקינים או לא צפויים, מתקין דמו לא מוכר, אסימון פגום |
-| 400 | `INVALID_TRANSITION` | מעבר הסטטוס מפר את הכללים |
-| 400 | `VENDOR_REQUIRED` | `VENDOR_ACCEPTED` ללא ספק משויך |
-| 400 | `VENDOR_LOCKED` | שינוי ספק אחרי שההזמנה עזבה את `DRAFT`/`SUBMITTED` |
-| 400 | `ORDER_NOT_CLAIMABLE` | תפיסה של הזמנה שאינה `READY_FOR_INSTALL` |
-| 400 | `ORDER_NOT_UPLOADABLE` | הרשאת העלאה להזמנה שהושלמה או בוטלה |
-| 403 | `UPLOAD_SIGNATURE_INVALID` | כתובת העלאה שלא נחתמה בשרת הזה, ששונתה, או ששייכת להעלאה או להזמנה אחרת |
-| 404 | `NOT_FOUND` | אין הזמנה עם המזהה הזה |
-| 409 | `VERSION_CONFLICT` | `expectedVersion` ישן בשינוי סטטוס או ספק |
-| 409 | `CLAIM_UNAVAILABLE` | מישהו מחזיק תפיסה פעילה או מאושרת (גם: המפסיד במרוץ תפיסה) |
-| 409 | `CLAIM_EXPIRED` | האימות של התפיסה הגיע ברגע הפקיעה או אחריו |
-| 409 | `CLAIM_NOT_ACTIVE` | האסימון או המתקין אינם תואמים לתפיסה הנוכחית (שוחררה, הוחלפה או אושרה) |
-| 409 | `IDEMPOTENCY_CONFLICT` | `clientRequestId` שומש שוב עבור קובץ אחר |
-| 409 | `DEMO_LIMIT_REACHED` | `POST /api/orders` כשיש 200 הזמנות, או `POST .../uploads` כשלהזמנה כבר 20 ניסיונות העלאה |
-| 409 | `UPLOAD_EXPIRED` | הרשאת ההעלאה פגה לפני ההשלמה או הביטול |
-| 409 | `UPLOAD_CANCELLED` / `UPLOAD_FAILED` / `UPLOAD_ALREADY_COMPLETED` | הניסיון כבר הסתיים אחרת |
-| 500 | `INTERNAL_ERROR` | כשל לא צפוי (כולל `UPLOAD_SIGNING_SECRET` חסר). הפרטים נרשמים בשרת בלבד |
+| 400 | `INVALID_JSON` | the body is not valid JSON |
+| 400 | `VALIDATION_ERROR` | invalid id; missing, invalid or unexpected fields; unknown demo installer; malformed token |
+| 400 | `INVALID_TRANSITION` | the status transition breaks the rules |
+| 400 | `VENDOR_REQUIRED` | `VENDOR_ACCEPTED` without an assigned vendor |
+| 400 | `VENDOR_LOCKED` | vendor change after the order left `DRAFT`/`SUBMITTED` |
+| 400 | `ORDER_NOT_CLAIMABLE` | claim on an order that is not `READY_FOR_INSTALL` |
+| 400 | `ORDER_NOT_UPLOADABLE` | upload authorization for a completed or cancelled order |
+| 403 | `UPLOAD_SIGNATURE_INVALID` | upload URL not signed by this server, modified, or belonging to another upload or order |
+| 404 | `NOT_FOUND` | no order with that id |
+| 409 | `VERSION_CONFLICT` | stale `expectedVersion` on a status or vendor change |
+| 409 | `CLAIM_UNAVAILABLE` | someone holds an active or confirmed claim (also: the loser of a claim race) |
+| 409 | `CLAIM_EXPIRED` | verification arrived at or after the claim's expiry |
+| 409 | `CLAIM_NOT_ACTIVE` | token or installer does not match the current claim (released, replaced or confirmed) |
+| 409 | `IDEMPOTENCY_CONFLICT` | `clientRequestId` reused for a different file |
+| 409 | `DEMO_LIMIT_REACHED` | `POST /api/orders` when 200 orders exist, or `POST .../uploads` when the order already has 20 upload attempts |
+| 409 | `UPLOAD_EXPIRED` | the upload authorization expired before completion or abort |
+| 409 | `UPLOAD_CANCELLED` / `UPLOAD_FAILED` / `UPLOAD_ALREADY_COMPLETED` | the attempt already ended differently |
+| 500 | `INTERNAL_ERROR` | unexpected failure (including a missing `UPLOAD_SIGNING_SECRET`); details are logged on the server only |
 
-בפריסה ב־Vercel, כלל ה־WAF מחזיר `429` לפני שהבקשה מגיעה לאפליקציה (ראו
-[docs/deployment.md](deployment.md)).
+On Vercel, the WAF rule answers `429` before a request reaches the app (see
+[docs/deployment.md](deployment.md#waf)).
 
-### עדכון סטטוס אטומי
+### Atomic Status Update
 
-`changeOrderStatus` קורא את ההזמנה (404), בודק את `expectedVersion` (409) ואת
-המעבר (400), ואז מבצע `update` מותנה **אחד** ב־MongoDB: הסינון
-`{ _id, status: <status read>, version: expectedVersion }`, והעדכון `$set status`,
-`$inc version`, `$currentDate updatedAt`. אם אף מסמך אינו מתאים, בקשה אחרת
-הקדימה, והתשובה היא 409.
+`changeOrderStatus` reads the order (404), checks `expectedVersion` (409) and
+the transition (400), then performs **one** conditional MongoDB `update`:
+filter `{ _id, status: <status read>, version: expectedVersion }`, update
+`$set status`, `$inc version`, `$currentDate updatedAt`. If it matches no
+document, another request won, and the answer is 409.
 
-`prisma.order.updateMany` אינו בשימוש: מול MongoDB, Prisma 6 מריץ אותו
-כ־aggregate שבוחר מזהים ואחריו עדכון שמסונן לפי `_id` בלבד (נצפה ב־profiler של
-MongoDB), כך שהתנאי לא היה חלק מהכתיבה עצמה. פקודות גולמיות עוברות דרך
-`prisma.$runCommandRaw`.
+`prisma.order.updateMany` is not used: with MongoDB, Prisma 6 runs it as an
+aggregate that selects matching ids followed by an update filtered by `_id`
+alone (seen with the MongoDB profiler), so the condition would not be part of
+the write itself. Raw commands go through `prisma.$runCommandRaw`.
 
-## תפיסת מתקינים (נעילה אופטימית)
+## Installer Claims (Optimistic Locking)
 
-זו אפשרות "optimistic DB locking" מהמשימה: ללא Redis וללא טרנזקציות מרובות
-מסמכים. כל שינוי במצב התפיסה הוא **עדכון מותנה אחד** שהסינון שלו כולל את כל
-התנאים המוקדמים, כך שהבדיקה והשינוי אטומיים, וכל שינוי מעלה את `version`.
+This is the task's "optimistic DB locking" option: no Redis and no
+multi-document transactions. Every claim state change is a **single
+conditional update** whose filter contains all preconditions, so check and
+change are atomic, and every change increments `version`.
 
-| פעולה | הסינון (כל התנאים חייבים להתקיים בזמן הכתיבה) | השינוי |
+| Operation | Filter (all must hold at write time) | Change |
 | --- | --- | --- |
-| תפיסה | `status = READY_FOR_INSTALL`, וגם `claimState` חסר או `NONE`, או `PENDING_VERIFICATION` עם `claimExpiresAt <= now` | `PENDING_VERIFICATION`, מתקין, גיבוב אסימון חדש, `claimExpiresAt = now + 180 s`, `claimedAt = now` |
-| אימות `PASSED` | `claimState = PENDING_VERIFICATION`, אותו מתקין, אותו גיבוב אסימון, `claimExpiresAt > now`, `status = READY_FOR_INSTALL` | `CONFIRMED`, גיבוב האסימון ומועד הפקיעה מנוקים |
-| אימות `FAILED` | כמו בשורה הקודמת, ללא תנאי הסטטוס | שחרור (`NONE`, שדות התפיסה מנוקים) |
-| שחרור בפקיעה | `claimState = PENDING_VERIFICATION`, גיבוב האסימון שנראה בסריקה, `claimExpiresAt <= now` | שחרור |
+| Claim | `status = READY_FOR_INSTALL`, and `claimState` missing or `NONE`, or `PENDING_VERIFICATION` with `claimExpiresAt <= now` | `PENDING_VERIFICATION`, installer, new token hash, `claimExpiresAt = now + 180 s`, `claimedAt = now` |
+| Verification `PASSED` | `claimState = PENDING_VERIFICATION`, same installer, same token hash, `claimExpiresAt > now`, `status = READY_FOR_INSTALL` | `CONFIRMED`; token hash and expiry cleared |
+| Verification `FAILED` | same as above, without the status condition | released (`NONE`, claim fields cleared) |
+| Expiry release | `claimState = PENDING_VERIFICATION`, the token hash seen by the scan, `claimExpiresAt <= now` | released |
 
-השלכות:
+Consequences:
 
-- **רק תפיסה פעילה אחת:** תפיסות מקבילות מתחרות על אותו עדכון מותנה. בדיוק
-  אחת מתאימה ומקבלת `201`, והשאר מקבלות `409 CLAIM_UNAVAILABLE`.
-- **תפיסה שפקעה ניתנת לתפיסה מיד**, עוד לפני שה־worker משחרר אותה, כי סינון
-  התפיסה מקבל תפיסות ממתינות שפקעו.
-- **אסימונים ישנים חסרי ערך:** תפיסה חדשה מקבלת אסימון אקראי חדש, ואימות
-  ושחרור דורשים את גיבוב האסימון ואת המתקין הנוכחיים.
-- **תפיסות מאושרות לעולם אינן פוקעות:** `CONFIRMED` מוחרג מכל תנאי פקיעה,
-  ומועד הפקיעה שלו מנוקה.
-- **השעון הוא של MongoDB.** הכתיבות משתמשות ב־`$$NOW` (זמן המסד בזמן הכתיבה),
-  כך ששרתי אפליקציה ו־workers עם סטיית שעון אינם חלוקים על הפקיעה. תפיסה
-  פעילה כל עוד `now < claimExpiresAt`, וברגע הפקיעה היא כבר פגה. הבדיקות
-  מעבירות `now` קבוע במקום `$$NOW`.
-- אסימון התפיסה הוא 32 בתים אקראיים (base64url), ונשמר רק גיבוב ה־SHA-256 שלו.
+- **Only one active claim:** concurrent claims race on the same conditional
+  update; exactly one matches and gets `201`, the others get
+  `409 CLAIM_UNAVAILABLE`.
+- **An expired claim is immediately claimable**, even before the worker
+  releases it, because the claim filter accepts expired pending claims.
+- **Old tokens are useless:** a new claim gets a new random token, and
+  verification and release require the current token hash and installer.
+- **Confirmed claims never expire:** `CONFIRMED` is excluded from every
+  expiry condition and its expiry field is cleared.
+- **The clock is MongoDB's.** Writes use `$$NOW` (the database time at write
+  time), so app servers and workers with skewed clocks cannot disagree about
+  expiry. A claim is active while `now < claimExpiresAt`; at the expiry
+  instant it is expired. Tests pass a fixed `now` instead of `$$NOW`.
+- The claim token is 32 random bytes (base64url); only its SHA-256 hash is
+  stored.
 
-### זהויות דמו ואימות מדומה
+### Demo Identities and Simulated Verification
 
-- המתקינים הם רשימה קבועה ב־`src/lib/claims/installers.ts` (Alex Rivera,
-  Sam Patel, Jordan Lee). הבורר **Acting as installer** בממשק (לכל לשונית,
-  ב־`sessionStorage`) בוחר אחד מהם. השרת בודק רק שהמזהה ברשימה. **זה אינו
-  אימות או הרשאה**: כל אחד יכול לשלוח כל מזהה דמו. אסימון התפיסה הוא שקושר את
-  האימות ללשונית שתפסה.
-- אימות הזהות או התשלום מדומה: הלשונית שתפסה מציגה שני כפתורים, מסומנים
-  בבירור כדמו, ששולחים `outcome: "PASSED"` או `"FAILED"`. אין קריאה לספק אמיתי.
-- האסימון נשמר רק בזיכרון של הלשונית שתפסה (לא באחסון ולא בכתובת). רענון
-  הלשונית מאבד אותו, והתפיסה פוקעת לאחר שלוש דקות והעבודה חוזרת לזמינות.
+- Installers are a fixed list in `src/lib/claims/installers.ts` (Alex
+  Rivera, Sam Patel, Jordan Lee). The UI's **Acting as installer** selector
+  (per browser tab, in `sessionStorage`) chooses one. The server only checks
+  that the id is on the list. **This is not authentication or
+  authorization**: anyone can send any demo id. The claim token is what ties
+  verification to the tab that claimed.
+- Identity and payment verification is simulated: the claiming tab shows two
+  buttons, clearly marked as a demo, that send `outcome: "PASSED"` or
+  `"FAILED"`. No real provider is called.
+- The token is kept only in the claiming tab's memory (not in storage or the
+  URL). Reloading the tab loses it; the claim then expires after three
+  minutes and the job becomes available again.
 
-### ה־worker לפקיעת תפיסות
+### Claim-Expiry Worker
 
-`scripts/claim-expiry-worker.mts` הוא תהליך נפרד (לא חלק משרת האינטרנט, ללא
-`setTimeout` לכל תפיסה וללא אינדקס TTL, כי הזמנות לעולם אינן נמחקות).
+`scripts/claim-expiry-worker.mts` is a separate process: not part of the web
+server, no `setTimeout` per claim and no TTL index (orders are never
+deleted).
 
-כל סריקה קוראת את זמן MongoDB, מוצאת תפיסות ממתינות עם `claimExpiresAt <= now`
-דרך האינדקס `(claimState, claimExpiresAt)` (עד 100 בכל אצווה), ומשחררת כל
-אחת בעדכון המותנה שבטבלה. הכתיבה בודקת מחדש "עדיין ממתינה, אותו אסימון,
-פקעה", ולכן לעולם אינה נוגעת בתפיסה מאושרת או בתפיסה חדשה שנוצרה בין הסריקה
-לכתיבה, וכמה workers יכולים לרוץ יחד (כל תפיסה משתחררת פעם אחת בדיוק).
+Each sweep reads MongoDB's time, finds pending claims with
+`claimExpiresAt <= now` through the `(claimState, claimExpiresAt)` index (up
+to 100 per batch), and releases each one with the conditional update above.
+Because the write re-checks "still pending, same token, expired" at write
+time, it never touches a confirmed claim or a newer claim made between the
+scan and the write, and several workers can run at once (each claim is
+released exactly once).
 
-ה־worker נעצר בצורה מסודרת ב־SIGINT, SIGTERM או SIGBREAK: הסריקה הנוכחית
-מסתיימת, ואז החיבור למסד נסגר. הוא תהליך Node רגיל (`node --env-file=.env ...`),
-ולכן אינו יכול להשתמש ב־bundler של Next.js או בכינוי `@/`. לכן הקוד שהוא חולק
-עם ה־API נמצא בקובצי `.mts` ללא ייבוא מהאפליקציה
-(`src/lib/claims/store.mts`, `constants.mts`), שמיובאים עם הסיומת.
+The worker stops gracefully on SIGINT, SIGTERM or SIGBREAK: the current
+sweep finishes, then the database connection is closed. It is a plain Node
+process (`node --env-file=.env ...`), so it cannot use the Next.js bundler or
+the `@/` alias. That is why the code it shares with the API is in `.mts`
+files with no app imports (`src/lib/claims/store.mts`, `constants.mts`),
+imported with their extension.
 
-## העלאות (הדמיה של העלאה ישירה לענן)
+## Uploads (Simulated Direct-to-Cloud)
 
-> **זו הדמיה.** אף בית של קובץ אינו מועבר לשום מקום. "אחסון האובייקטים" מדומה
-> בדפדפן, הכתובת החתומה מפנה ל־`https://simulated-storage.invalid` (דומיין
-> שמור שלעולם אינו נפתר), ורק מטא־דאטה נשמר. הממשק אומר זאת בכל חלונית העלאה,
-> ומסמן את קובץ הדמו של 1.5 GB כ־"Demo · no content".
+> **This is a simulation.** No file bytes are transferred anywhere. The
+> "object store" is simulated in the browser, the signed URL points to
+> `https://simulated-storage.invalid` (a reserved domain that never
+> resolves), and only metadata is saved. The UI says so in every upload
+> dialog and marks the 1.5 GB demo file as "Demo · no content".
 
-המשימה מבקשת *להדמות* העלאה ישירה לענן של קבצי הדפסה של "1GB+" עם כתובות
-חתומות מראש, ולכן לא שולב אחסון אמיתי.
+The task asks to *simulate* direct-to-cloud uploads of "1GB+" print files
+with pre-signed URLs, so no real storage is integrated.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant B as דפדפן (לשונית A)
+    participant B as Browser (tab A)
     participant API as Next.js API
     participant DB as MongoDB
-    participant S as אחסון מדומה (בדפדפן)
-    participant O as לשוניות אחרות
+    participant S as Simulated store (in browser)
+    participant O as Other tabs
     B->>API: POST /api/orders/{id}/uploads {clientRequestId, name, size, type}
-    API->>DB: ההזמנה קיימת ואינה סופית? יצירת Upload (PENDING_UPLOAD)
-    API-->>B: {upload, uploadUrl (חתומה), expiresAt}
-    B->>S: "PUT" uploadUrl, התקדמות מקומית בלבד
-    Note over B,S: אין בתים שיוצאים מהדפדפן, אין כתיבה למסד בכל אחוז
-    alt הסתיים
+    API->>DB: order exists and is not final? create Upload (PENDING_UPLOAD)
+    API-->>B: {upload, uploadUrl (signed), expiresAt}
+    B->>S: "PUT" uploadUrl, progress shown locally only
+    Note over B,S: no bytes leave the browser, no DB write per percent
+    alt finished
         B->>API: POST .../uploads/{uploadId}/complete {uploadUrl}
-        API->>DB: אימות החתימה, ואז עדכון מותנה ל־COMPLETED
-    else ביטול או כשל מדומה
+        API->>DB: verify signature, then conditional update to COMPLETED
+    else cancelled or simulated failure
         B->>API: POST .../uploads/{uploadId}/abort {uploadUrl, reason}
-        API->>DB: אימות החתימה, ואז עדכון מותנה ל־CANCELLED או FAILED
+        API->>DB: verify signature, then conditional update to CANCELLED or FAILED
     end
-    DB-->>API: אירוע change stream (uploads)
-    API-->>O: snapshot ב־SSE עם סטטוס ההעלאה (מטא־דאטה בלבד)
+    DB-->>API: change stream event (uploads)
+    API-->>O: SSE snapshot with the upload's status (metadata only)
 ```
 
-**הכתובת החתומה.** HMAC-SHA256 עם `UPLOAD_SIGNING_SECRET` (בצד השרת בלבד) על:
-גרסה, פעולה (`PUT`), מזהה העלאה, מזהה הזמנה, `storageKey`, הגודל המדויק, סוג
-התוכן ומועד התפוגה. שינוי של כל אחד מהם, שימוש בכתובת של העלאה אחרת או בנתיב
-של הזמנה אחרת מחזירים `403 UPLOAD_SIGNATURE_INVALID`, וההשוואה נעשית בזמן
-קבוע. השלמה וביטול דורשים את הכתובת החתומה של אותה העלאה בדיוק, ולכן רק
-הדפדפן שקיבל אותה יכול לסיים או לבטל את הניסיון.
+**Signed URL.** HMAC-SHA256 with `UPLOAD_SIGNING_SECRET` (server-side only)
+over: version, operation (`PUT`), upload id, order id, `storageKey`, exact
+size, content type and expiry. Changing any of them, using another upload's
+URL or another order's path gives `403 UPLOAD_SIGNATURE_INVALID`; the
+signature is compared in constant time. Completion and abort require the
+signed URL of exactly that upload, so only the browser that received it can
+finish or cancel that attempt.
 
-**כללים.**
+**Rules.**
 
-- **הזמנות סופיות:** ניסיון העלאה **חדש** נדחה כשההזמנה `COMPLETED` או
-  `CANCELLED` בזמן הבקשה. ההעלאות שמורות באוסף משלהן (ללא טרנזקציה מרובת
-  מסמכים), ולכן ניסיון שקיבל הרשאה *לפני* שההזמנה הפכה לסופית עדיין יכול
-  להסתיים או להתבטל אחר כך. זו ההתנהגות המוגדרת, ולא הבטחה שהזמנה סופית לעולם
-  לא תקבל קובץ (נבדק).
-- מגבלות: מבית אחד עד 5 GiB (מגבלת `PUT` חתום יחיד באחסוני אובייקטים נפוצים;
-  קבצים גדולים יותר ידרשו multipart upload), שמות עד 200 תווים ללא מפרידי
-  נתיב או תווי בקרה, ופורמטי הדפסה מרשימה מותרת (PDF, TIFF, PNG, JPEG, SVG,
-  EPS/AI, PSD) שהסיומת שלהם חייבת להתאים לסוג.
-- `storageKey` נוצר בשרת, ושם הקובץ הוא מטא־דאטה לתצוגה בלבד.
-- ההרשאה אידמפוטנטית לפי `clientRequestId` (מזהה אחד לכל לחיצה על "Start
-  upload"): לחיצה כפולה מחזירה את אותו ניסיון. "Try again" יוצר ניסיון חדש
-  עם מזהה חדש, והניסיון שנכשל נשאר `FAILED`.
-- השלמה וביטול הם כתיבות מותנות יחידות (`PENDING_UPLOAD` וטרם פג בזמן הכתיבה,
-  לפי שעון MongoDB). חזרה על אותה תוצאה אידמפוטנטית (`changed: false`).
-  השלמת ניסיון שבוטל או נכשל, ביטול ניסיון שהושלם, או כל פעולה אחרי התפוגה,
-  נדחים. בקשה לניסיון ישן אינה משפיעה על ניסיון חדש (מזהה וחתימה שונים).
-- התקדמות ההעלאה מקומית ללשונית המעלה (אפשרות "optimistic UI" מהמשימה).
-  לשוניות אחרות רואות רק מטא־דאטה וסטטוס שמורים, שנדחפים ב־SSE.
-- ההעלאות אינן קשורות למחזור הסטטוסים של ההזמנה (המשימה אינה דורשת זאת), ואין
-  כפתור הורדה, כי אין קובץ.
+- **Final orders:** a **new** upload attempt is refused when the order is
+  `COMPLETED` or `CANCELLED` at the time of the request. Uploads live in their
+  own collection (no multi-document transaction), so an attempt authorized
+  *before* the order became final may still complete or be aborted
+  afterwards. This is the defined behavior, not a guarantee that a final
+  order never gets a file (tested).
+- Limits: 1 byte to 5 GiB (the single pre-signed `PUT` limit of common object
+  stores; larger files would need multipart uploads), names up to 200
+  characters without path separators or control characters, and
+  allow-listed print formats (PDF, TIFF, PNG, JPEG, SVG, EPS/AI, PSD) whose
+  extension must match the type.
+- The `storageKey` is generated by the server; the file name is display
+  metadata only.
+- Authorization is idempotent per `clientRequestId` (one id per "Start
+  upload" action): a double click returns the same attempt. "Try again"
+  creates a new attempt with a new id; the failed one stays `FAILED`.
+- Completion and abort are single conditional writes (`PENDING_UPLOAD` and
+  not expired at write time, on MongoDB's clock). Repeating the same outcome
+  is idempotent (`changed: false`). Completing a cancelled or failed attempt,
+  cancelling a completed one, or anything after expiry is refused. A request
+  for an old attempt cannot affect a newer one (different id and signature).
+- Upload progress is local to the uploading tab (the task's "optimistic UI"
+  option). Other tabs see only persisted metadata and status, pushed via SSE.
+- Uploads are not tied to the order status flow (not required by the task),
+  and there is no download button, because no file exists.
 
-**מגבלות ההדמיה וכיצד אחסון אמיתי יחליף אותה.**
+**Limits of the simulation and how real storage would replace it.**
 
-- *דיווח השלמה מהדפדפן אינו הוכחה שהקובץ קיים.* כאן השרת מקבל אותו אחרי בדיקת
-  החתימה והמצב. עם אחסון אמיתי (S3, GCS, Azure Blob) השרת היה בודק את האובייקט
-  עצמו לפני סימון `COMPLETED`, למשל `HeadObject` על `storageKey` כדי לוודא
-  שהוא קיים בגודל ובסוג החתומים (ואופציונלית checksum), או מסמן השלמה מאירוע
-  אחסון מאומת (למשל התראת S3 `ObjectCreated`). הכתובת החתומה עצמה הייתה נוצרת
-  ב־SDK של הספק (למשל `getSignedUrl(PutObjectCommand)`) עם אורך התוכן והסוג
-  כחלק מהחתימה, והאחסון, ולא השרת הזה, היה אוכף את החתימה על ה־`PUT`.
-- בצד הדפדפן ההדמיה היא `DirectUploadAdapter` ב־
-  `src/lib/uploads/simulated-storage.ts`. מתאם אמיתי היה שולח `PUT` עם ה־`File`
-  ל־`uploadUrl` דרך `XMLHttpRequest` (בשביל אירועי התקדמות). המתאם המדומה
-  לעולם אינו קורא את תוכן הקובץ: מקובץ שנבחר נלקחים רק השם, הגודל והסוג,
-  ולקובץ הדמו אין תוכן כלל.
-- ניסיונות `PENDING_UPLOAD` נטושים אינם מנוקים. אחרי `authorizationExpiresAt`
-  הם מוצגים כפגי תוקף ואי אפשר להשלים אותם. אחסון אמיתי היה צריך גם כלל
-  lifecycle לאובייקטים חלקיים.
+- *A completion report from the browser is not proof that the file exists.*
+  Here the server accepts it after checking the signature and state. With a
+  real object store (S3, GCS, Azure Blob), the server would instead check the
+  object itself before marking it `COMPLETED`, for example with `HeadObject`
+  on `storageKey` to confirm it exists with the exact signed size and type
+  (and optionally a checksum), or mark it complete from a verified storage
+  event (such as an S3 `ObjectCreated` notification). The signed URL itself
+  would be created by the provider SDK (for example
+  `getSignedUrl(PutObjectCommand)`), with the content length and type part
+  of the signature, and the store, not this server, would enforce the
+  signature on the `PUT`.
+- The browser side is `DirectUploadAdapter` in
+  `src/lib/uploads/simulated-storage.ts`; a real adapter would `PUT` the
+  `File` to `uploadUrl` with `XMLHttpRequest` (for progress events). The
+  simulated adapter never reads file content: for a chosen file only its
+  name, size and type are used, and the demo file has no content at all.
+- Abandoned `PENDING_UPLOAD` attempts are not swept; after
+  `authorizationExpiresAt` they are shown as expired and can no longer be
+  completed. A real store would also need a lifecycle rule for incomplete
+  objects.
 
-## עדכונים חיים (Change Streams ו־SSE)
+## Live Updates (Change Streams and SSE)
 
-`GET /api/orders/events` שולח אירועי `snapshot` (`{ orders, serverTime }`)
-ו־`heartbeat` (`{ serverTime }`). ה־snapshots נדחפים מ־MongoDB Change Streams,
-ושום דבר אינו מתשאל את המסד בלולאה.
+`GET /api/orders/events` streams `snapshot` events (`{ orders, serverTime }`)
+and `heartbeat` events (`{ serverTime }`). Snapshots are pushed by MongoDB
+Change Streams; nothing polls the database.
 
 ```mermaid
 flowchart LR
-    W1[כתיבות Next.js API] --> DB[(MongoDB replica set)]
-    W2[worker לפקיעת תפיסות] --> DB
-    DB -- "change stream: orders, uploads" --> F["Order feed<br/>(אחד לכל תהליך שרת)"]
-    F -- "קריאה מחדש של DTOs ציבוריים<br/>אחרי אירוע" --> DB
-    F --> C1[לקוח SSE 1]
-    F --> C2[לקוח SSE 2]
-    F --> C3[לקוח SSE N]
+    W1[Next.js API writes] --> DB[(MongoDB replica set)]
+    W2[Claim-expiry worker] --> DB
+    DB -- "change stream: orders, uploads" --> F["Order feed<br/>(one per server process)"]
+    F -- "re-read public DTOs<br/>after an event" --> DB
+    F --> C1[SSE client 1]
+    F --> C2[SSE client 2]
+    F --> C3[SSE client N]
 ```
 
 `src/lib/realtime/order-feed.ts`:
 
-- **change stream אחד לכל תהליך שרת**, משותף לכל לקוחות ה־SSE. הוא נפתח
-  כשהלקוח הראשון מתחבר, ונסגר (יחד עם ה־`MongoClient` שלו) כשהאחרון עוזב. הוא
-  צופה באוספים `orders` ו־`uploads`, כך שכתיבות מכל תהליך (האפליקציה, ה־worker,
-  מופעים אחרים) מגיעות כאירועים.
-- **אירוע פירושו רק "משהו השתנה"**: ה־feed קורא מחדש את ה־snapshot דרך Prisma
-  (DTOs ציבוריים בלבד; מסמכים גולמיים, גיבובי אסימונים, `storageKey` וכתובות
-  חתומות לעולם אינם נשלחים), ודוחף אותו לכל הלקוחות אם הוא שונה מהקודם. אירועים
-  שמגיעים בזמן קריאה מאוחדים לקריאה נוספת אחת. קריאות מתבצעות רק אחרי אירועים
-  או חיבורים, לעולם לא לפי טיימר (בדיקת אינטגרציה מוודאת זאת).
-- **מרוץ ההפעלה:** הזרם נפתח והסמן שלו מתבסס (`tryNext()`) *לפני* קריאת
-  ה־snapshot הראשון, כך ששום כתיבה אינה נופלת בין ה־snapshot לזרם. לקוח שמתחבר
-  מאוחר יותר מקבל מיד את ה־snapshot השמור, ואחריו כל שינוי.
-- **כשלים:** הדרייבר מתאושש בעצמו משגיאות חולפות. אם הזרם עדיין נכשל, ה־feed
-  פותח אותו מחדש עם השהיה אקספוננציאלית (`REALTIME_RETRY_BASE_MS`, ברירת מחדל
-  שנייה אחת, עד 30 שניות), **וממשיך מה־resume token האחרון**, כך שהשינויים
-  שהוחמצו משוחזרים. אם השרת דוחה את ה־token (למשל כשהוא כבר לא ב־oplog), ה־feed
-  נפתח מחדש בלעדיו ומבצע **סנכרון מלא**.
-- **Heartbeats** כל `SSE_HEARTBEAT_MS` (ברירת מחדל 15 שניות) מונעים מ־proxies
-  לסגור חיבורים שקטים ומרעננים את הפרש השעון של הלקוח. הם לעולם אינם מתשאלים את
-  המסד: `serverTime` מוערך מזמן MongoDB של ה־snapshot האחרון ועוד השעון המונוטוני
-  של התהליך.
-- **לקוחות:** לקוח חדש או מתחבר מחדש תמיד מתחיל עם ה־snapshot הנוכחי, ולכן לעולם
-  אינו נשאר עם נתונים ישנים. `EventSource` מנסה שוב בעצמו (`retry: 3000`), ואם
-  הוא מוותר, הלקוח מתחבר מחדש עם השהיה. הממשק מציג **Live** או **Reconnecting…**.
-- **אורך חיי הזרם:** ה־route מייצא `maxDuration = 300` (המקסימום ב־Vercel
-  Hobby, שחל גם על תשובות בהזרמה). כל זרם מסתיים בעצמו 20 שניות קודם: השרת
-  שולח אירוע `reconnect` ומריץ את הניקוי הרגיל, והלקוח מתחבר מחדש מיד, בלי
-  להציג *Reconnecting…*. זה חל גם בהרצת Docker (חיבור מחדש קצר כל 280 שניות).
-- **מיזוג בלקוח** (`src/lib/orders/merge.ts`): snapshots, תשובות `GET` ותשובות
-  לפעולות יכולים להגיע שלא לפי הסדר. לכל הזמנה גובר ה־`version` הגבוה. העלאות
-  ממוזגות בנפרד (איחוד לפי מזהה, והעלאה לעולם אינה חוזרת מסטטוס סופי לממתין),
-  כי שינויי העלאה אינם מעלים את `order.version`.
-- **הפעלה מחדש של ה־feed:** כשהלקוח האחרון עוזב ה־feed נעצר. לקוח שמתחבר מיד
-  אחר כך (למשל ברענון דף) מקבל snapshot ראשוני טרי, גם אם קריאה מה־feed שנעצר
-  עדיין רצה (נבדק).
-- **ניקוי:** בניתוק המנוי וה־heartbeat מוסרים. כשאין לקוחות, אין change stream,
-  לקוח מסד, טיימר ניסיון חוזר או interval (הבדיקות בודקות את מצב ה־feed ואת
-  הטיימרים הפעילים של התהליך).
+- **One change stream per server process**, shared by all SSE clients,
+  opened when the first client connects and closed (together with its
+  `MongoClient`) when the last one leaves. It watches the `orders` and
+  `uploads` collections, so writes from any process (this app, the worker,
+  other instances) arrive as events.
+- **An event only means "something changed".** The feed then re-reads the
+  snapshot through Prisma (public DTOs only; raw documents, token hashes,
+  `storageKey` and signed URLs are never sent) and pushes it to all clients
+  if it differs from the last one. Events that arrive while a read is running
+  are coalesced into one more read. Reads happen only after events or
+  (re)connects, never on a timer (an integration test asserts this).
+- **Start-up race:** the stream is opened and its cursor established
+  (`tryNext()`) *before* the first snapshot is read, so no write can fall
+  between the snapshot and the stream. A client that connects later gets the
+  cached snapshot immediately, then every change.
+- **Failures:** the driver resumes transient errors itself. If the stream
+  still fails, the feed reopens it with exponential backoff
+  (`REALTIME_RETRY_BASE_MS`, default 1 s, max 30 s), **resuming after the
+  last resume token**, which replays the changes it missed. If the server
+  rejects the token (for example when it is no longer in the oplog), the
+  feed reopens without it and performs a **full re-sync**.
+- **Heartbeats** every `SSE_HEARTBEAT_MS` (default 15 s) keep proxies from
+  closing idle connections and refresh the client's clock offset. They never
+  query the database: `serverTime` is estimated from the last snapshot's
+  MongoDB time plus this process's monotonic clock.
+- **Clients:** a new or reconnecting client always starts with the current
+  snapshot, so it never keeps stale data. `EventSource` retries by itself
+  (`retry: 3000`); if it gives up, the client reconnects with backoff. The UI
+  shows **Live** or **Reconnecting…**.
+- **Stream lifetime:** the route exports `maxDuration = 300` (the Vercel
+  Hobby maximum, which also applies to streamed responses). Each stream ends
+  itself 20 s earlier: the server sends a `reconnect` event and runs its
+  normal cleanup, and the client reconnects at once without showing
+  *Reconnecting…*. This also applies in the Docker run (one short reconnect
+  every 280 s).
+- **Merging on the client** (`src/lib/orders/merge.ts`): SSE snapshots, GET
+  responses and mutation responses can arrive out of order. Per order the
+  higher `version` wins. Uploads are merged separately (union by id, and an
+  upload never moves back from a final status to pending), because upload
+  changes do not bump `order.version`.
+- **Feed restarts:** when the last client leaves, the feed stops. A client
+  that connects right after (for example after a page reload) gets a fresh
+  initial snapshot, even if a read from the stopped feed was still running
+  (regression-tested).
+- **Cleanup:** on disconnect the subscription and heartbeat interval are
+  removed. With no clients left there is no change stream, database client,
+  retry timer or interval (tests check the feed state and the process's
+  active timers).
 
-מגבלות: כל תהליך שרת פותח change stream משלו, וכל אירוע קורא מחדש את כל רשימת
-ההזמנות (ללא עימוד), מה שמתאים לגודל הנתונים כאן. Change Streams דורשים replica
-set (כבר בשימוש). המטמון של ה־snapshot הוא לכל תהליך, ונמחק כשהלקוח האחרון
-עוזב.
+Limitations: each server process opens its own change stream, and each event
+re-reads the whole (unpaginated) order list, which is fine for this dataset
+size. Change Streams require a replica set (already used). The snapshot cache
+is per process and is dropped when the last client leaves.
 
-## ממשק המשתמש
+## User Interface
 
-`src/app/page.tsx` מרנדר מעטפת סטטית. `src/components/orders/` טוען את הרשימה
-בדפדפן (`GET` ראשוני ואחריו SSE), ולכן בניית הדף לעולם אינה צריכה מסד.
+`src/app/page.tsx` renders a static shell; `src/components/orders/` loads the
+list in the browser (initial `GET`, then SSE), so the page build never needs
+the database.
 
-- רשימת הזמנות עם סטטוס, תאריך יצירה, ולהזמנות שמוכנות להתקנה (או עם מתקין
-  מאושר) שורת תפיסה: *Open for installers*, *Claimed by … · awaiting
-  verification · m:ss left*, *…'s claim expired · open for installers*, או
-  *Installer: … · verified*.
-- חלונית **Installer assignment** (לכל הזמנה שמוכנה להתקנה): תפיסה בשם המתקין
-  הנבחר, הצגת מחזיק התפיסה והספירה לאחור, ובלשונית שתפסה בלבד, כפתורי
-  **Verification simulation (demo)**.
-- הספירה לאחור משתמשת במועד הפקיעה מהשרת ובהפרש הנמדד בין השעון המקומי לשעון
-  המסד (`serverTime`). תפיסה ממתינה מוצגת כפגה מרגע הפקיעה, עוד לפני שה־worker
-  רץ, והלשונית שתפסה מקבלת הודעת פקיעה.
-- הודעות ברורות על מרוץ תפיסה שאבד (409), פקיעה, אימות שנכשל והתנגשויות סטטוס.
-  הכפתורים מושבתים בזמן שבקשה בדרך. הודעות התוצאה בחלונית התפיסה קשורות לתפיסה
-  שהן מתארות, ונעלמות כשהנתונים העדכניים מראים תפיסה אחרת.
-- חלונית **Print files** (לכל הזמנה): בחירת קובץ (נלקחים רק שם, גודל וסוג) או
-  קובץ הדמו של 1.5 GB, אפשרות להדמות כשל רשת, התחלה, התקדמות מקומית, ביטול
-  וניסיון חוזר. מציגה כל ניסיון של ההזמנה עם הסטטוס השמור שלו.
-- חלונית **Vendor** (לכל הזמנה `DRAFT`/`SUBMITTED`): בחירת ספק דמו או אף אחד.
-  *Mark vendor accepted* מושבת, עם הסבר, עד שמשויך ספק.
-- חלוניות **New order** ו־**Change status**.
+- Order list with status, creation date and, for orders ready for install
+  (or with a confirmed installer), a claim line: *Open for installers*,
+  *Claimed by … · awaiting verification · m:ss left*, *…'s claim expired ·
+  open for installers*, or *Installer: … · verified*.
+- **Installer assignment** dialog (per order ready for install): claim as the
+  acting installer, see who holds the claim and the countdown, and, in the
+  claiming tab only, the **Verification simulation (demo)** buttons.
+- The countdown uses the server's expiry and the measured offset between the
+  local clock and the database clock (`serverTime`). A pending claim is shown
+  as expired from its expiry instant, even before the worker runs, and the
+  claiming tab gets an expiry message.
+- Clear messages for a lost claim race (409), expiry, failed verification and
+  status conflicts. Buttons are disabled while a request is in flight.
+  Outcome messages in the assignment dialog are tied to the claim they
+  describe and disappear once the latest data shows a different claim.
+- **Print files** dialog (per order): choose a file (only name, size and type
+  are used) or the 1.5 GB demo file, optionally simulate a network failure,
+  start, watch local progress, cancel and try again. It lists every attempt
+  of the order with its persisted status.
+- **Vendor** dialog (per `DRAFT`/`SUBMITTED` order): pick one of the demo
+  vendors or none. *Mark vendor accepted* stays disabled, with a hint, until a
+  vendor is assigned.
+- **New order** and **Change status** dialogs.
 
-## מגבלות ההדגמה
+## Demo Limitations
 
-**זהויות הדמו אינן הרשאות.** המתקינים והספקים הם רשימת דמו קבועה שנבחרת
-בדפדפן, והשרת בודק רק שהמזהה ברשימה. אין התחברות, ולכן **כל מי שיכול לפתוח את
-האתר יכול לשנות את נתוני ההדגמה**:
+**Demo identities are not permissions.** Installers and vendors are a fixed
+demo list chosen in the browser, and the server only checks that an id is on
+the list. There is no login, so **anyone who can open the site can change the
+demo data**:
 
-- לקרוא כל הזמנה, ליצור הזמנות, לשנות סטטוס של כל הזמנה (כולל ביטול והשלמה)
-  ולשייך ספקים;
-- לתפוס כל עבודה מוכנה בשם כל מתקין דמו (האימות עדיין דורש את אסימון התפיסה,
-  שנמצא רק בלשונית שתפסה);
-- להתחיל העלאות מדומות לכל הזמנה שאינה סופית.
+- read every order, create orders, change any order's status (including
+  cancelling or completing it) and assign vendors;
+- claim any ready job as any demo installer (verification still needs the
+  claim token, which only the claiming tab has);
+- start simulated uploads on any order that is not final.
 
-**תקרות נתונים** (`src/lib/demo-limits.mts`), כי כל עדכון חי קורא ושולח מחדש את
-כל רשימת ההזמנות:
+**Data limits** (`src/lib/demo-limits.mts`), because every live update
+re-reads and sends the whole order list:
 
-| מגבלה | אכיפה | דחייה |
+| Limit | Enforcement | Refusal |
 | --- | --- | --- |
-| **200 הזמנות** במסד | `createOrder` (`src/lib/orders/service.ts`): טרנזקציית MongoDB אחת כותבת את המסמך המשותף ב־`demo_limits`, סופרת את ההזמנות ויוצרת. יצירות מקבילות כותבות לאותו מסמך, ולכן MongoDB מבטל את כולן חוץ מאחת (write conflict), והן מנסות שוב עם ספירה עדכנית. הספירה היא של ההזמנות בפועל, כך שמחיקת הזמנות מפנה מקום. | `409 DEMO_LIMIT_REACHED`, מוצג בחלונית *New order* |
-| **20 ניסיונות העלאה להזמנה**, כולל ניסיונות שנכשלו, בוטלו או פגו | `authorizeUpload` (`src/lib/uploads/service.ts`): עדכון מותנה אחד מוסיף את ה־`clientRequestId` לרשימה `uploadRequestIds` של ההזמנה רק אם הוא כבר שם, או אם יש פחות מ־20. בקשה חוזרת (לחיצה כפולה או ניסיון חוזר) משתמשת באותו מקום ומחזירה את אותו ניסיון. מקומות לעולם אינם מוחזרים. | `409 DEMO_LIMIT_REACHED`, מוצג בחלונית *Print files*. החלונית גם משביתה את *Start upload* כשלהזמנה 20 ניסיונות |
+| **200 orders** in the database | `createOrder` (`src/lib/orders/service.ts`): one MongoDB transaction writes the shared `demo_limits` document, counts the orders and inserts. Concurrent creations write the same document, so MongoDB aborts all but one (write conflict) and they retry with a fresh count. The count is of the real orders, so deleting orders frees places. | `409 DEMO_LIMIT_REACHED`, shown in the *New order* dialog |
+| **20 upload attempts per order**, including failed, cancelled and expired ones | `authorizeUpload` (`src/lib/uploads/service.ts`): one conditional update adds the request's `clientRequestId` to the order's `uploadRequestIds` only if it is already there or fewer than 20 are. Repeating a request (a double click, a retry) uses the same place and returns the same attempt; places are never given back. | `409 DEMO_LIMIT_REACHED`, shown in the *Print files* dialog; the dialog also disables *Start upload* once the order lists 20 attempts |
 
-שתיהן מכוסות ב־`tests/integration/demo-limits.test.ts` (בקשות מקבילות על
-המקומות האחרונים, בקשות חוזרות בתקרה) ובבדיקת הממשק (שתי ההודעות בחלוניות).
+Both are covered by `tests/integration/demo-limits.test.ts` (parallel
+requests for the last places, repeated requests at the limit) and by the UI
+check (both messages in the dialogs).
 
-**מה התקרות אינן עושות.** הן מגבילות רק נתונים שמורים. הן אינן מגבילות את מספר
-הבקשות, חיבורי SSE פתוחים או תעבורה, ולכן לקוח עדיין יכול למצות את המכסות של
-המארח ושל המסד (זמן ריצה וזיכרון של פונקציות, תעבורה, פעולות לשנייה במסד).
-במסלולים חינמיים המשמעות יכולה להיות האטה או חסימה של יכולת עד סוף תקופת
-החיוב, לא חשבון לתשלום. כלל ה־WAF בפריסה מגביל את קצב הכתיבות בלבד, ואינו
-מבטיח מניעת מיצוי מכסות (ראו [docs/deployment.md](deployment.md)).
+**What the limits do not do.** They bound stored data only. They do not limit
+the number of requests, open SSE connections or data transfer, so a client
+can still use up the host's and the database's quotas (function time and
+memory, bandwidth, database operations per second). On free plans that can
+mean throttling or a feature being blocked for the rest of the billing
+period, not a bill. The WAF rule in the deployment limits the write rate only
+and does not guarantee that quotas cannot be exhausted (see
+[docs/deployment.md](deployment.md#waf)).
 
-## כיסוי דרישות המשימה
+## Task Requirement Coverage
 
-סוג הדרישה: מ = מפורשת, כ = ניסוח כללי, ה = הנחה שנעשתה כאן.
+Kind: E = explicit requirement, G = general wording, A = assumption made
+here.
 
-| דרישה | סוג | היכן | אומת על ידי | פער שנותר |
+| Requirement | Kind | Where | Verified by | Remaining gap |
 | --- | --- | --- | --- | --- |
-| Next.js App Router, MongoDB עם Prisma, Tailwind עם shadcn, TypeScript | מ | כל המאגר | `npm run check` | אין |
-| API ועיבוד אירועים ב־API routes | מ | `src/app/api/orders/**`, change stream ל־SSE בשרת Next.js | אינטגרציה, בדיקת ממשק | ניקוי פקיעת התפיסות רץ ב־worker נפרד, והפקיעה נאכפת ב־API ([רכיבים](#רכיבים)) |
-| מכונת מצבים `DRAFT` עד `COMPLETED`, נאכפת בממשק **ובשרת** | מ | `src/lib/orders/status.ts`, נתיב הסטטוס, חלונית Change status | יחידה (כל 49 הזוגות), אינטגרציה, בדיקת ממשק | אין |
-| `CANCELLED` רק לפני `IN_PRODUCTION`; מעברים לא חוקיים נחסמים עם משוב בממשק ו־HTTP 400 | מ | כנ"ל | יחידה ואינטגרציה (`400 INVALID_TRANSITION`) | הממשק מציע רק פעולות מותרות, ולכן ה־400 נבדק בעיקר ברמת ה־API |
-| "manage … vendor assignments" | כ | `src/lib/vendors`, נתיב הספק, חלונית Vendor | אינטגרציה (`vendors.test.ts`), בדיקת ממשק | מינימלי: ספקי דמו קבועים, ללא חשבונות ספקים |
-| מקביליות: כמה מתקינים מקבלים, בדיוק אחד משויך (Redis או נעילה אופטימית במסד) | מ | `src/lib/claims/store.mts` (עדכון מותנה) | אינטגרציה (2 ו־12 תפיסות מקבילות), בדיקת ממשק בשני חלונות | אין |
-| שחרור הנעילה אם אימות הזהות או התשלום נכשל תוך 3 דקות | מ | פקיעת תפיסה (`claimExpiresAt`), אימות `FAILED`, ה־worker | אינטגרציה (שעון מוזרק, תהליך worker), בדיקת ממשק, בדיקה ידנית בענן | האימות מדומה (כפתורי דמו) |
-| הדמיית העלאה ישירה לענן של קבצי 1GB+ עם כתובות חתומות מראש | מ | `src/lib/uploads/*`, נתיבי ההעלאה, חלונית Print files | יחידה (חתימה, הדמיית 5 GiB), אינטגרציה, בדיקת ממשק | אחסון מדומה; ההשלמה מדווחת מהדפדפן |
-| התקדמות העלאה בזמן אמת ב־WS / SSE / optimistic UI, ללא תשאול חוזר של המסד | מ | התקדמות מקומית (optimistic UI) ו־Change Streams ל־SSE | אינטגרציה (אין קריאות במצב שקט; שני לקוחות), בדיקת ממשק | לשוניות אחרות רואות סטטוס, לא התקדמות באחוזים (ה) |
-| מעקב חי אחר מחזור חיי ההזמנה; חיוויים לשינויי מצב, העלאות ותפיסות | מ/כ | ה־feed של SSE, החיווי Live, שורות התפיסה וההעלאה | בדיקות SSE באינטגרציה, בדיקת ממשק | אין |
-| חלוניות: Order Creation, Status Transitions, Installer Assignment | מ | שלוש החלוניות | בדיקת ממשק | אין |
-| רספונסיבי (טלפון, טאבלט, מחשב) | מ | פריסת Tailwind | ראו [בדיקות רספונסיביות](development-and-testing.md) | ב־768 פיקסלים לוח הבקרה ושאר החלוניות נבדקו ידנית בלבד, לפני תיקון הרוחב האחרון של *Print files* |
-| מאגר עם docker-compose (`docker-compose.yml` מועדף) | מ | `docker-compose.yml`, `Dockerfile` | הרצת קבלה מקומית ב־Docker | אין |
-| README: סכמת המסד, אסטרטגיית הנעילה, צינור ההעלאה | מ | [README](../README.md) ומסמך זה | אין | אין |
-| כתובת פריסה חיה | מ | https://sign-flow-flame.vercel.app (מוגנת, קישור הגישה נמסר בנפרד) | בדיקה ידנית בענן ([docs/deployment.md](deployment.md)) | אין |
+| Next.js App Router, MongoDB with Prisma, Tailwind with shadcn, TypeScript | E | whole repository | `npm run check` | none |
+| Backend API and event processing in API routes | E | `src/app/api/orders/**`, change stream to SSE in the Next.js server | integration, UI check | claim-expiry cleanup runs in a separate worker; expiry is enforced by the API ([Components](#components)) |
+| State machine `DRAFT` to `COMPLETED`, enforced in the UI **and** the backend | E | `src/lib/orders/status.ts`, status route, Change status dialog | unit (all 49 pairs), integration, UI check | none |
+| `CANCELLED` only before `IN_PRODUCTION`; invalid jumps blocked with UI feedback and HTTP 400 | E | same | unit and integration (`400 INVALID_TRANSITION`) | the UI offers only allowed actions, so the 400 is mostly exercised at API level |
+| "manage … vendor assignments" | G | `src/lib/vendors`, vendor route, Vendor dialog | integration (`vendors.test.ts`), UI check | minimal: fixed demo vendors, no vendor accounts |
+| Concurrency: several installers accept, exactly one is assigned (Redis or optimistic DB lock) | E | `src/lib/claims/store.mts` (conditional update) | integration (2 and 12 parallel claims), two-window UI check | none |
+| Release the lock if identity or payment verification fails within 3 minutes | E | claim expiry (`claimExpiresAt`), `FAILED` verification, worker | integration (injected clock, worker process), UI check, manual cloud check | verification is simulated (demo buttons) |
+| Simulate direct-to-cloud upload of 1GB+ files with pre-signed URLs | E | `src/lib/uploads/*`, upload routes, Print files dialog | unit (signing, 5 GiB simulation), integration, UI check | simulated store; completion is reported by the browser |
+| Real-time upload progress via WS / SSE / optimistic UI, without repeated DB polling | E | local progress (optimistic UI) plus Change Streams to SSE | integration (no reads while idle; two clients), UI check | other tabs see status, not per-percent progress (A) |
+| Real-time order lifecycle tracking; indicators for state changes, uploads and claims | E/G | SSE feed, Live indicator, row claim and upload lines | SSE integration tests, UI check | none |
+| Interactive modals: Order Creation, Status Transitions, Installer Assignment | E | the three dialogs | UI check | none |
+| Responsive (mobile, tablet, desktop) | E | Tailwind layout | see [manual local checks](development-and-testing.md#3-manual-local-checks) | at 768 px the dashboard and the other dialogs were checked manually only, before the last *Print files* width fix |
+| Repository with docker-compose (`docker-compose.yml` preferred) | E | `docker-compose.yml`, `Dockerfile` | local Docker acceptance run | none |
+| README: database schema, lock strategy, upload pipeline | E | [README](../README.md) and this document | none | none |
+| Live deployment URL | E | https://sign-flow-flame.vercel.app (protected; the access link is provided separately) | manual cloud check ([docs/deployment.md](deployment.md#cloud-check-results)) | none |

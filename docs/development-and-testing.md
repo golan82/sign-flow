@@ -1,519 +1,575 @@
-# פיתוח ובדיקות
+# Development and Testing
 
-מסמך זה מפרט את הפיתוח המקומי, את פרטי הרצת ה־Docker, את הבדיקות ואת
-תוצאותיהן. להרצה המהירה ב־Docker ראו את [README](../README.md).
+This document covers local development, the Docker run in detail,
+troubleshooting, the tests and their results. For the quick start, see the
+[README](../README.md).
 
-## דרישות מוקדמות
+## Prerequisites
 
-- **Node.js `^22.18.0 || ^24.0.0 || >=26.0.0`** (`engines` ב־`package.json`).
-  זה החיתוך של דרישות הכלים: Vitest 5 (`^22.12 || ^24 || >=26`), ESLint 9
-  (`^20.19 || ^22.13 || >=24`), Next.js 16 (`>=20.9`), וקובצי ה־`.mts` שרצים
-  ישירות ב־Node וצריכים הסרת טיפוסים מובנית (פעילה כברירת מחדל מ־22.18). הפיתוח
-  נעשה עם Node.js 24.14.0.
-- npm (הפיתוח נעשה עם npm 11.9.0).
-- Docker Desktop עם Linux containers (למסד המקומי).
+- **Node.js `^22.18.0 || ^24.0.0 || >=26.0.0`** (`engines` in `package.json`).
+  This is the intersection of the tools' requirements: Vitest 5
+  (`^22.12 || ^24 || >=26`), ESLint 9 (`^20.19 || ^22.13 || >=24`), Next.js 16
+  (`>=20.9`), and the `.mts` scripts run directly by Node, which need native
+  TypeScript type stripping (on by default from 22.18). Developed with
+  Node.js 24.14.0.
+- npm (developed with npm 11.9.0).
+- Docker Desktop with Linux containers (for the local database).
 - Git.
 
-## פיתוח מקומי (Windows PowerShell)
+## Local Development (Windows PowerShell)
 
-Next.js וה־worker רצים ישירות ב־Windows, ורק MongoDB רץ ב־Docker
-(`compose.dev.yaml`, דרך `npm run db:up` / `db:stop`). PowerShell עלול לחסום את
-`npm.ps1` ו־`npx.ps1`, ולכן משתמשים ב־`npm.cmd` וב־`npx.cmd`.
+Next.js and the worker run directly on Windows; only MongoDB runs in Docker
+(`compose.dev.yaml`, wrapped by `npm run db:up` / `db:stop`). PowerShell may
+block `npm.ps1` and `npx.ps1`, so use `npm.cmd` and `npx.cmd` as below.
 
-### הרצה ראשונה
+### First Run
 
 ```powershell
-npm.cmd ci                        # התקנה; postinstall מריץ prisma generate
-Copy-Item .env.example .env       # DATABASE_URL ו־TEST_DATABASE_URL (מוחרג מ־Git)
-# הכניסו סוד אקראי ל־UPLOAD_SIGNING_SECRET ב־.env, למשל:
+npm.cmd ci                        # install; postinstall runs `prisma generate`
+Copy-Item .env.example .env       # DATABASE_URL and TEST_DATABASE_URL (git-ignored)
+# Put a random secret into UPLOAD_SIGNING_SECRET in .env, for example:
 node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
-npm.cmd run db:up                 # הפעלת MongoDB והמתנה עד PRIMARY
-npm.cmd run db:push               # החלת הסכמה (אינדקסים) על מסד הפיתוח
+npm.cmd run db:up                 # start MongoDB, wait until it is PRIMARY
+npm.cmd run db:push               # apply the schema (indexes) to the dev database
 npm.cmd run dev                   # http://localhost:3000
-npm.cmd run worker:claims         # בטרמינל שני: ה־worker לפקיעת תפיסות
+npm.cmd run worker:claims         # in a second terminal: claim-expiry worker
 ```
 
-פורט 27017 על `127.0.0.1` חייב להיות פנוי:
-
-```powershell
-Get-NetTCPConnection -LocalPort 27017 -State Listen -ErrorAction SilentlyContinue
-```
-
-### הרצות הבאות
+### Later Runs
 
 ```powershell
 npm.cmd run db:up
 npm.cmd run dev
-npm.cmd run worker:claims         # טרמינל שני; Ctrl+C עוצר בצורה מסודרת
+npm.cmd run worker:claims         # second terminal; Ctrl+C stops it gracefully
 ```
 
-אחרי שינוי ב־`prisma/schema.prisma` מריצים `npm.cmd run db:push` (פיתוח)
-ו־`npm.cmd run db:push:test` (בדיקות; רץ אוטומטית גם ב־`test:integration`).
+After changing `prisma/schema.prisma`, run `npm.cmd run db:push` (dev) and
+`npm.cmd run db:push:test` (tests; also run automatically by
+`test:integration`).
 
-### אפשרויות ה־worker
+### Worker Options
 
 ```powershell
-npm.cmd run worker:claims                 # לולאה; Ctrl+C עוצר אחרי הסריקה הנוכחית
-npm.cmd run worker:claims -- --once       # סריקה אחת ויציאה
-$env:CLAIM_SWEEP_INTERVAL_MS = "2000"; npm.cmd run worker:claims   # ברירת מחדל 5000 ms
+npm.cmd run worker:claims                 # loop; Ctrl+C stops after the current sweep
+npm.cmd run worker:claims -- --once       # one sweep, then exit
+$env:CLAIM_SWEEP_INTERVAL_MS = "2000"; npm.cmd run worker:claims   # default 5000 ms
 ```
 
-ב־Windows, Ctrl+C שולח SIGINT. `taskkill /F` אינו מאפשר עצירה מסודרת.
+On Windows, Ctrl+C delivers SIGINT; `taskkill /F` cannot be handled
+gracefully.
 
-### עצירת המסד (הנתונים נשמרים)
+### Stopping the Database (Keeps Data)
 
 ```powershell
 npm.cmd run db:stop               # docker compose -f compose.dev.yaml stop mongodb
 ```
 
-גם `docker compose -f compose.dev.yaml down` (ללא `-v`) שומר את הנתונים: הוא
-מסיר את הקונטיינר והרשת, אבל לא את ה־volumes.
+`docker compose -f compose.dev.yaml down` (without `-v`) also keeps the data:
+it removes the container and network but not the named volumes.
 
-> **אזהרה:** `docker compose -f compose.dev.yaml down -v` או
-> `docker volume rm sign-flow_mongodb_data` **מוחקים לצמיתות את כל נתוני
-> הפיתוח המקומיים.**
+> **Warning:** `docker compose -f compose.dev.yaml down -v` or
+> `docker volume rm sign-flow_mongodb_data` **permanently deletes all local
+> development data.**
 
-## הרצה מלאה ב־Docker: פרטים
+## Full Docker Run: Details
 
-ההוראות המהירות נמצאות ב־[README](../README.md).
+The quick start is in the [README](../README.md#run-with-docker).
 
-| פעולה | פקודה |
+| Task | Command |
 | --- | --- |
-| מצב | `docker compose ps` |
-| לוגים (הכול / שירות אחד) | `docker compose logs -f` / `docker compose logs -f app` (או `worker`, `mongodb`, `schema`) |
-| עצירה, **הנתונים נשמרים** | `docker compose stop` |
-| הפעלה מחדש | `docker compose up -d --wait` |
-| הפעלה מחדש של האפליקציה וה־worker | `docker compose restart app worker` |
-| בנייה מחדש אחרי שינויי קוד | `docker compose up -d --build --wait` |
-| הסרת קונטיינרים ורשת, **הנתונים נשמרים** | `docker compose down` |
+| Status | `docker compose ps` |
+| Logs (all / one service) | `docker compose logs -f` / `docker compose logs -f app` (or `worker`, `mongodb`, `schema`) |
+| Stop, **keeping data** | `docker compose stop` |
+| Start again | `docker compose up -d --wait` |
+| Restart app and worker | `docker compose restart app worker` |
+| Rebuild after code changes | `docker compose up -d --build --wait` |
+| Remove containers and network, **keeping data** | `docker compose down` |
 
-> **אזהרה:** `docker compose down -v` מוחק את ה־volumes של הפרויקט
-> (`signflow_mongodb_data`, `signflow_mongodb_config`) ואיתם **את כל הנתונים**
-> של הרצת ה־Docker. הוא אינו נוגע במסד הפיתוח.
+> **Warning:** `docker compose down -v` deletes the volumes of this project
+> (`signflow_mongodb_data`, `signflow_mongodb_config`) and with them **all
+> data** of the Docker run. It does not touch the development database.
 
-### השירותים
+### Services
 
-`docker-compose.yml`, פרויקט Compose בשם `signflow`:
+`docker-compose.yml`, Compose project `signflow`:
 
-| שירות | יעד באימג' | תפקיד |
+| Service | Image target | Role |
 | --- | --- | --- |
-| `mongodb` | `mongo:8.0.38` | replica set בצומת יחיד `rs0`, חבר `mongodb:27017`; **ללא פורט חיצוני** |
-| `schema` | `schema` | `prisma db push` חד־פעמי (אינדקסים), ואז יציאה עם 0 |
-| `app` | `app` | שרת Next.js standalone, מפורסם על `127.0.0.1:${APP_PORT:-3080}` |
-| `worker` | `worker` | ה־worker לפקיעת תפיסות |
+| `mongodb` | `mongo:8.0.38` | single-node replica set `rs0`, member `mongodb:27017`; **no published port** |
+| `schema` | `schema` | one-shot `prisma db push` (indexes), then exits 0 |
+| `app` | `app` | Next.js standalone server, published on `127.0.0.1:${APP_PORT:-3080}` |
+| `worker` | `worker` | claim-expiry worker |
 
-סדר ההפעלה מבוסס על מוכנות אמיתית, ללא המתנות קבועות: `mongodb` תקין רק כשה־replica
-set מאותחל ו־PRIMARY, אחר כך `schema` חייב להסתיים בהצלחה, ואז `app` ו־`worker`
-מופעלים. `app` תקין כש־`GET /api/orders` עונה (מה שמוכיח גם את החיבור למסד).
-`--wait` חוזר בנקודה הזו.
+Start-up order uses real readiness, no sleeps: `mongodb` is healthy only when
+its replica set is initiated and PRIMARY, then `schema` must exit
+successfully, then `app` and `worker` start. `app` is healthy when
+`GET /api/orders` answers (which also proves the database connection).
+`--wait` returns at that point.
 
-> **תצורת הדגמה מקומית, לא פריסה ציבורית מאובטחת:** ל־MongoDB אין אימות (נגיש
-> רק בתוך רשת ה־Compose), אין TLS, והאפליקציה מפורסמת על 127.0.0.1 בלבד.
+> **Local demo configuration, not a secure public deployment:** MongoDB has
+> no authentication (reachable only inside the Compose network), there is no
+> TLS, and the app is published on 127.0.0.1 only.
 
-### בניית האימג'ים
+### How the Images Are Built
 
-`Dockerfile` רב־שלבי, על בסיס `node:24.14.0-bookworm-slim` (אותה גרסת Node.js
-כמו בפיתוח), עם `openssl` עבור מנוע Prisma ו־`tini`:
+`Dockerfile` (multi-stage, base `node:24.14.0-bookworm-slim`, the same
+Node.js version as development, plus `openssl` for the Prisma engine and
+`tini`):
 
-- `deps`: `npm ci` (ה־`postinstall` מריץ `prisma generate` ל־Linux).
-- `builder`: `next build` עם `BUILD_STANDALONE=1`, כלומר `output: "standalone"`.
-  הבנייה אינה צריכה מסד ואינה צריכה `UPLOAD_SIGNING_SECRET`.
-- `app`: רק שרת ה־standalone והקבצים הסטטיים (כ־130 MB).
-- `worker`: רק `scripts/claim-expiry-worker.mts`, שני המודולים המשותפים שהוא
-  מייבא (`src/lib/claims/store.mts`, `constants.mts`) ו־Prisma Client שנוצר
-  (כ־115 MB). Node מריץ את קובצי ה־`.mts` ישירות (הסרת טיפוסים).
-- `schema`: עץ התלויות המלא (Prisma CLI), לשימוש פעם אחת בכל הפעלה.
-- כל יעדי הריצה רצים כמשתמש `node` ללא הרשאות, עם `tini` כ־PID 1 שמעביר את
-  `SIGTERM`. ב־`docker compose stop` ה־worker מסיים את הסריקה הנוכחית ויוצא
-  עם 0. האפליקציה יוצאת על האות (ל־Next.js standalone אין hook לכיבוי; קוד
-  יציאה 143).
-- `.dockerignore` מחריג מהקשר הבנייה את `.env*`, `node_modules`, `.next`, תוצאות
-  בדיקות, נתוני Git ואת `docs`. אף קובץ `.env` אינו מועתק לאימג'.
-  `UPLOAD_SIGNING_SECRET` מגיע לאפליקציה רק כמשתנה סביבה בזמן ריצה מ־`.env`
-  (Compose מסרב להפעיל את האפליקציה בלעדיו).
+- `deps`: `npm ci` (its `postinstall` runs `prisma generate` for Linux).
+- `builder`: `next build` with `BUILD_STANDALONE=1`, that is
+  `output: "standalone"`. The build needs no database and no
+  `UPLOAD_SIGNING_SECRET`.
+- `app`: only the standalone server and static assets (about 130 MB).
+- `worker`: only `scripts/claim-expiry-worker.mts`, the two shared `.mts`
+  modules it imports (`src/lib/claims/store.mts`, `constants.mts`) and the
+  generated Prisma client (about 115 MB). Node runs the `.mts` files directly
+  (type stripping).
+- `schema`: the full dependency tree (Prisma CLI), used once per start.
+- All runtime targets run as the unprivileged `node` user, with `tini` as
+  PID 1 forwarding `SIGTERM`. On `docker compose stop` the worker finishes
+  its current sweep and exits 0; the app exits on the signal (Next.js
+  standalone has no shutdown hook; exit code 143).
+- `.dockerignore` keeps `.env*`, `node_modules`, `.next`, test results, Git
+  data and `docs` out of the build context; no `.env` is copied into an
+  image. `UPLOAD_SIGNING_SECRET` reaches the app only as a run-time
+  environment variable from `.env` (Compose refuses to start the app without
+  it).
 
-### פיתוח לעומת הרצה מלאה ב־Docker
+### Development vs. Full Docker Run
 
-| | פיתוח מקומי (Windows) | הרצה מלאה ב־Docker |
+| | Local development (Windows) | Full Docker run |
 | --- | --- | --- |
-| קובץ ופרויקט Compose | `compose.dev.yaml` / `sign-flow` | `docker-compose.yml` / `signflow` |
-| מה רץ ב־Docker | MongoDB בלבד | MongoDB, schema, app, worker |
-| אפליקציה ו־worker | `npm run dev`, `npm run worker:claims` ב־Windows | קונטיינרים |
-| פורט MongoDB | `127.0.0.1:27017` | לא מפורסם |
-| חבר ה־replica set | `127.0.0.1:27017` | `mongodb:27017` |
+| Compose file / project | `compose.dev.yaml` / `sign-flow` | `docker-compose.yml` / `signflow` |
+| What runs in Docker | MongoDB only | MongoDB, schema, app, worker |
+| App and worker | `npm run dev`, `npm run worker:claims` on Windows | containers |
+| MongoDB port | `127.0.0.1:27017` | not published |
+| Replica set member | `127.0.0.1:27017` | `mongodb:27017` |
 | Volumes | `sign-flow_mongodb_data`, `sign-flow_mongodb_config` | `signflow_mongodb_data`, `signflow_mongodb_config` |
-| כתובת המסד | `DATABASE_URL` ב־`.env` (127.0.0.1) | מוגדרת ב־`docker-compose.yml` (`mongodb`) |
+| Database URL | `.env` `DATABASE_URL` (127.0.0.1) | set in `docker-compose.yml` (`mongodb`) |
 
-כתובת החבר ב־replica set נשמרת בתוך כל volume כשה־set מאותחל, והדרייברים עוברים
-לכתובת הזו אחרי הגילוי. תהליכי Windows צריכים `127.0.0.1:27017`, וקונטיינרים
-צריכים `mongodb:27017`. לכן שתי התצורות משתמשות **ב־volumes נפרדים**.
-`docker/mongodb/replica-set.js` לעולם אינו מגדיר מחדש set קיים: אם volume אותחל
-עם כתובת אחרת, הוא נשאר לא תקין ורושם את אי ההתאמה בלוג. שתי התצורות יכולות לרוץ
-בו־זמנית (פורטים שונים).
+The replica set member address is stored inside each volume when the set is
+initiated, and drivers switch to that address after discovery. Windows
+processes need `127.0.0.1:27017`; containers need `mongodb:27017`. The two
+setups therefore use **separate volumes**. `docker/mongodb/replica-set.js`
+never reconfigures an existing set: if a volume was initiated with another
+address, it stays unhealthy and logs the mismatch. Both setups can run at the
+same time (different ports).
 
-## המסד
+### Troubleshooting
 
-### למה replica set
+| Symptom | Cause and fix |
+| --- | --- |
+| Compose refuses to start `app` and mentions `UPLOAD_SIGNING_SECRET` | `.env` has no secret. Create it as shown in the [README](../README.md#run-with-docker); it must be at least 32 characters. |
+| Port 3080 is already in use | Add `APP_PORT=<port>` to `.env` and run `docker compose up -d --wait` again. |
+| `docker compose up --wait` does not return or a service is unhealthy | Check `docker compose ps` and `docker compose logs -f <service>`. `schema` must exit 0 before `app` and `worker` start. |
+| `mongodb` stays unhealthy and logs a member address mismatch | The volume was initiated with another replica set address. The script never reconfigures it; use the matching setup (dev or Docker) or a new volume. |
+| `npm run db:up` fails locally | Port 27017 on `127.0.0.1` must be free. Check with `Get-NetTCPConnection -LocalPort 27017 -State Listen -ErrorAction SilentlyContinue`. |
+| PowerShell blocks `npm` or `npx` | Use `npm.cmd` and `npx.cmd`. |
+| Prisma CLI cannot find `DATABASE_URL` | Keep it in `.env`; the Prisma CLI does not read `.env.local`. |
+| The dashboard shows *Reconnecting…* for long | Check the `app` logs and the database connection. A short reconnect every 280 s is expected and does not show *Reconnecting…*. |
 
-replica set הוא קבוצת תהליכי `mongod` שמחזיקים את אותם נתונים, עם PRIMARY אחד
-שמקבל כתיבות. MongoDB תומך בטרנזקציות מרובות מסמכים רק ב־replica set, וה־connector
-של Prisma ל־MongoDB משתמש בטרנזקציות בכתיבות מקוננות. גם Change Streams דורשים
-replica set. בשרת עצמאי Prisma נכשל עם `Transactions are not supported by this
-deployment`. לכן מקומית רץ replica set **בצומת יחיד** בשם `rs0`, שהוא תמיד
-PRIMARY.
+## Database
 
-### ההגדרה
+### Why a Replica Set
 
-- `mongod --replSet rs0` רץ בשירות `mongodb` של כל אחד מקובצי ה־Compose. הנתונים
-  נשמרים ב־volumes של אותו פרויקט (`/data/db` ו־`/data/configdb`).
-- `docker/mongodb/replica-set.js` הוא ה־healthcheck של הקונטיינר. הוא קורא
-  ל־`rs.initiate()` רק אם ה־set עדיין לא מאותחל (בטוח להרצה חוזרת), מדווח תקין
-  רק כשהצומת PRIMARY, ומסרב (נשאר לא תקין, יציאה 2) אם ה־set ב־volume משתמש
-  בכתובת חבר שונה מ־`MONGO_REPLICA_HOST`. הוא לעולם אינו מגדיר מחדש בשקט.
-  להרצה ידנית (פיתוח):
+A replica set is a group of `mongod` processes that hold the same data, with
+one PRIMARY that accepts writes. MongoDB only supports multi-document
+transactions on replica sets, and Prisma's MongoDB connector uses
+transactions internally for nested writes. Change Streams also require a
+replica set. On a standalone server Prisma fails with `Transactions are not
+supported by this deployment`. For local runs we therefore use a
+**single-node** replica set named `rs0`: one member that is always PRIMARY.
+
+### Setup
+
+- `mongod --replSet rs0` runs in the `mongodb` service of either Compose
+  file. Data lives in that project's named volumes (`/data/db` and
+  `/data/configdb`).
+- `docker/mongodb/replica-set.js` is the container healthcheck. It calls
+  `rs.initiate()` only if the set is not initialized yet (safe to re-run),
+  reports healthy only when the node is PRIMARY, and refuses (stays
+  unhealthy, exit 2) if the volume's set uses a different member address
+  than `MONGO_REPLICA_HOST`. It never reconfigures silently. To re-run it
+  manually (development):
 
   ```powershell
   docker compose -f compose.dev.yaml exec mongodb mongosh --quiet --file /docker/replica-set.js
   ```
 
-- עם `?replicaSet=rs0` הדרייבר פונה קודם לכתובת ההתחלתית, מגלה את החברים מתצורת
-  ה־replica set, ואז מתחבר לכתובת החבר המפורסמת. בפיתוח זו `127.0.0.1:27017`,
-  ובהרצה המלאה `mongodb:27017` (נקבע דרך `MONGO_REPLICA_HOST`
-  ב־`docker-compose.yml`). אם משנים את פורט הפיתוח, יש לשנות אותו
-  ב־`compose.dev.yaml`, ב־`MONGO_REPLICA_HOST` או בברירת המחדל של הסקריפט ובשתי
-  הכתובות, ולהשתמש ב־volume חדש.
+- With `?replicaSet=rs0` the driver first contacts the seed host, discovers
+  the members from the replica set config, and then connects to the
+  advertised member address. In development that is `127.0.0.1:27017`; in
+  the full run it is `mongodb:27017` (set via `MONGO_REPLICA_HOST` in
+  `docker-compose.yml`). If you change the development port, change it in
+  `compose.dev.yaml`, in `MONGO_REPLICA_HOST` or the script default, and in
+  both URLs, and use a new volume.
 
 ### Prisma
 
-- הסכמה: `prisma/schema.prisma` (ספק MongoDB).
-- שינויי סכמה מוחלים ב־`prisma db push` (`db:push`, `db:push:test`).
-  `prisma migrate` אינו נתמך ב־MongoDB. `db push` יוצר אינדקסים, אבל אינו כותב
-  מחדש מסמכים קיימים.
-- קוד השרת מייבא את הלקוח המשותף מ־`@/lib/prisma`. הוא מסומן `server-only`
-  וממחזר `PrismaClient` אחד בין טעינות חמות בפיתוח.
+- Schema: `prisma/schema.prisma` (MongoDB provider).
+- Schema changes are applied with `prisma db push` (`db:push`,
+  `db:push:test`). `prisma migrate` is not supported for MongoDB. `db push`
+  creates indexes but does not rewrite existing documents.
+- Server code imports the shared client from `@/lib/prisma`. It is marked
+  `server-only` and reuses one `PrismaClient` across hot reloads in
+  development.
 
-## משתני סביבה
+## Environment Variables
 
-`.env` (מוחרג מ־Git; תבנית ב־`.env.example`). בהרצה המלאה ב־Docker, Compose
-קורא ממנו רק את `UPLOAD_SIGNING_SECRET`, `APP_PORT` ו־`CLAIM_SWEEP_INTERVAL_MS`.
-ה־`DATABASE_URL` של הקונטיינרים קבוע ב־`docker-compose.yml`.
+`.env` is git-ignored; the template is `.env.example`. In the full Docker
+run, Compose reads only `UPLOAD_SIGNING_SECRET`, `APP_PORT` and
+`CLAIM_SWEEP_INTERVAL_MS` from it; the containers' `DATABASE_URL` is fixed in
+`docker-compose.yml`.
 
-| משתנה | בשימוש של | ברירת מחדל / דוגמה |
+| Variable | Used by | Default / example |
 | --- | --- | --- |
-| `UPLOAD_SIGNING_SECRET` | חתימת כתובות העלאה (**חובה**; בצד השרת בלבד, לפחות 32 תווים; ב־Docker מוזרק בזמן ריצה) | אקראי, למשל 32 בתים אקראיים ב־base64url |
-| `APP_PORT` | הרצת Docker: פורט האפליקציה במחשב, על 127.0.0.1 (אופציונלי) | `3080` |
-| `DATABASE_URL` | Next.js (Prisma ולקוח ה־change stream), Prisma CLI, ה־worker | פיתוח: `mongodb://127.0.0.1:27017/signflow?replicaSet=rs0`; Docker: `mongodb://mongodb:27017/signflow?replicaSet=rs0` (מוגדר ב־compose) |
-| `TEST_DATABASE_URL` | פיתוח בלבד: בדיקות אינטגרציה, בדיקות מסד, `db:push:test` | `mongodb://127.0.0.1:27017/signflow_test?replicaSet=rs0` |
-| `CLAIM_SWEEP_INTERVAL_MS` | ה־worker (אופציונלי) | `5000` |
-| `REALTIME_RETRY_BASE_MS` | בסיס ההשהיה לחיבור מחדש של ה־change stream (אופציונלי) | `1000` (עד 30 שניות) |
-| `SSE_HEARTBEAT_MS` | מרווח ה־heartbeat של SSE (אופציונלי) | `15000` |
-| `MONGO_REPLICA_HOST` | כתובת חבר ה־replica set עבור `replica-set.js` | ברירת מחדל בפיתוח `127.0.0.1:27017`; Docker `mongodb:27017` |
-| `BUILD_STANDALONE` | זמן בנייה בלבד (מוגדר ב־`Dockerfile`): `output: "standalone"` | לא מוגדר מקומית |
+| `UPLOAD_SIGNING_SECRET` | upload URL signing (**required**; server-side only, at least 32 characters; Docker: injected at run time) | random, for example 32 random bytes in base64url |
+| `APP_PORT` | Docker run: host port of the app on 127.0.0.1 (optional) | `3080` |
+| `DATABASE_URL` | Next.js (Prisma and the change-stream client), Prisma CLI, worker | dev: `mongodb://127.0.0.1:27017/signflow?replicaSet=rs0`; Docker: `mongodb://mongodb:27017/signflow?replicaSet=rs0` (set in Compose) |
+| `TEST_DATABASE_URL` | dev only: integration tests, DB checks, `db:push:test` | `mongodb://127.0.0.1:27017/signflow_test?replicaSet=rs0` |
+| `CLAIM_SWEEP_INTERVAL_MS` | worker (optional) | `5000` |
+| `REALTIME_RETRY_BASE_MS` | change-stream reconnect backoff base (optional) | `1000` (max 30 s) |
+| `SSE_HEARTBEAT_MS` | SSE heartbeat interval (optional) | `15000` |
+| `MONGO_REPLICA_HOST` | replica set member address used by `replica-set.js` | dev default `127.0.0.1:27017`; Docker `mongodb:27017` |
+| `BUILD_STANDALONE` | build time only (set in the `Dockerfile`): `output: "standalone"` | unset locally |
 
-`UPLOAD_SIGNING_SECRET` לעולם אינו נחשף לדפדפן: אין לו קידומת `NEXT_PUBLIC_`,
-והוא נקרא רק ב־`src/lib/uploads/signing.ts`, שמסומן `server-only`. החלפתו מבטלת
-כתובות העלאה פתוחות.
+`UPLOAD_SIGNING_SECRET` is never exposed to the browser: it has no
+`NEXT_PUBLIC_` prefix and is only read in `src/lib/uploads/signing.ts`, which
+is `server-only`. Rotating it invalidates outstanding upload URLs.
 
-`.env.atlas.local` (מוחרג מ־Git, מ־`.vercelignore` ומ־`.dockerignore`) מחזיק את
-`DATABASE_URL` של Atlas לפקודות חד־פעמיות, כמו `prisma db push` הראשוני. שום
-דבר אינו טוען אותו אוטומטית. מעבירים אותו במפורש, למשל
-`node --env-file=.env.atlas.local ...`. משתני הייצור מפורטים
-ב־[docs/deployment.md](deployment.md).
+`.env.atlas.local` (git-ignored, also excluded by `.vercelignore` and
+`.dockerignore`) holds the Atlas `DATABASE_URL` for one-off commands such as
+the initial `prisma db push`. Nothing loads it automatically; pass it
+explicitly, for example `node --env-file=.env.atlas.local ...`. Production
+variables are listed in [docs/deployment.md](deployment.md#production-environment-variables).
 
-Next.js ו־Prisma CLI טוענים את `.env` אוטומטית. Vitest טוען אותו דרך `loadEnv`
-ב־`vitest.config.mts`, וסקריפטי ה־`.mts` דרך `node --env-file=.env`. אין לשים את
-`DATABASE_URL` רק ב־`.env.local`, כי Prisma CLI אינו קורא את הקובץ הזה. אין
-`prisma.config.ts`, כי בנוכחותו Prisma 6 מפסיק לטעון את `.env` אוטומטית.
+Next.js and the Prisma CLI load `.env` automatically; Vitest loads it through
+`loadEnv` in `vitest.config.mts`, and the `.mts` scripts through
+`node --env-file=.env`. Do not put `DATABASE_URL` only in `.env.local`: the
+Prisma CLI does not read that file. There is no `prisma.config.ts`, because
+with one Prisma 6 stops loading `.env` automatically.
 
-## פקודות בדיקה
+## Test Commands
 
 ```powershell
-npm.cmd run typecheck            # טיפוסי הנתיבים של Next.js ו־tsc --noEmit
+npm.cmd run typecheck            # Next.js route types + tsc --noEmit
 npm.cmd run lint                 # ESLint
-npm.cmd run build                # בניית ייצור (ללא מסד)
-npm.cmd run check                # שלושתן, לפי הסדר
+npm.cmd run build                # production build (no database needed)
+npm.cmd run check                # all three, in order
 
-npm.cmd test                     # בדיקות יחידה (ללא מסד)
+npm.cmd test                     # unit tests (no database)
 
-# הבדיקות הבאות צריכות את המסד: npm.cmd run db:up
-npm.cmd run test:integration     # db:push:test, ואז בדיקות API, תפיסות, העלאות, מגבלות ו־SSE על signflow_test
-npm.cmd run test:db              # בדיקת קישוריות של Prisma (signflow_test)
-npm.cmd run test:db:persistence  # הנתונים שורדים הפעלה מחדש של שירות ה־mongodb בפיתוח (signflow_test)
+# The following need the database: npm.cmd run db:up
+npm.cmd run test:integration     # db:push:test, then API, claims, uploads, demo limits and SSE tests on signflow_test
+npm.cmd run test:db              # Prisma connectivity smoke test (signflow_test)
+npm.cmd run test:db:persistence  # data survives a restart of the dev mongodb service (signflow_test)
 ```
 
-### מסד הבדיקות
+### Test Database
 
-כל בדיקות המסד האוטומטיות כותבות רק למסד שב־`TEST_DATABASE_URL`
-(`signflow_test`), ולעולם לא ל־`DATABASE_URL` (`signflow`).
+All automated database tests write only to the database in
+`TEST_DATABASE_URL` (`signflow_test`), never to `DATABASE_URL` (`signflow`).
 
-- פרויקט האינטגרציה של Vitest מגדיר את `DATABASE_URL` לערך של
-  `TEST_DATABASE_URL` (`vitest.config.mts`). `tests/integration/setup.ts` רץ לפני
-  כל קובץ בדיקות וזורק שגיאה, לפני כל כתיבה, אם בדיקת ההגנה נכשלת.
-- בדיקת ההגנה (`tests/support/test-database.mts`, שמשמשת גם את בדיקות המסד
-  ב־`scripts/` ואת `db:push:test`) מסרבת לרוץ כש־`TEST_DATABASE_URL` חסר, כששם
-  המסד אינו מסתיים ב־`_test`, או כשהוא זהה למסד שב־`DATABASE_URL`.
-- `npm run test:integration` מחיל קודם את הסכמה על מסד הבדיקות
+- Vitest's integration project sets `DATABASE_URL` to `TEST_DATABASE_URL`
+  (`vitest.config.mts`); `tests/integration/setup.ts` runs before every test
+  file and throws, before any write, unless the guard passes.
+- The guard (`tests/support/test-database.mts`, also used by the `scripts/`
+  DB checks and `db:push:test`) refuses to run when `TEST_DATABASE_URL` is
+  missing, when its database name does not end in `_test`, or when it names
+  the same database as `DATABASE_URL`.
+- `npm run test:integration` first applies the schema to the test database
   (`scripts/db-push-test.mts`).
-- הבדיקות רושמות את המזהה של כל מסמך שהן יוצרות, ומוחקות בדיוק את המזהים האלה
-  ב־`finally`, גם כשבדיקה נכשלת. שום דבר אינו מרוקן אוסף.
-- בדיקות תפיסה שתלויות בזמן מזריקות שעון קבוע (`now`) לשירות, או קובעות מועד
-  פקיעה עבר על רשומת הבדיקה שלהן. שום בדיקה אינה ממתינה שלוש דקות, וה־TTL של
-  הייצור אינו משתנה.
+- Tests record the id of every document they create and delete exactly those
+  ids in `finally`, even when a test fails. Nothing clears a collection.
+- Time-dependent claim tests inject a fixed clock (`now`) into the service or
+  set a past expiry on their own test record. Nothing waits three minutes and
+  the production TTL is not changed.
 
-### בדיקת הממשק (שני חלונות דפדפן)
+### UI Check (Two Browser Windows)
 
-`tests/ui/ui-check.mts` מפעיל שני חלונות דפדפן ללא ממשק (A ברוחב 390 פיקסלים,
-B ברוחב מחשב) דרך Chrome DevTools Protocol. הוא מכסה:
+`tests/ui/ui-check.mts` drives two headless browser windows (A at 390 px,
+B at desktop width) through the Chrome DevTools Protocol. It covers:
 
-- יצירת הזמנה ושינוי סטטוס;
-- שני מתקינים שתופסים בו־זמנית, ואימות;
-- פקיעת תפיסה עם ה־worker;
-- העלאה מדומה. חלונית *Print files* חייבת להתאים ל־390×844 ול־768×1024 לפני
-  ההעלאה, במהלכה ועם היסטוריה של שמות קבצים ארוכים;
-- תפיסה שפקעה ונלקחת על ידי מתקין אחר, שנכשל באימות, תופס שוב, עובר ומשלים.
-  אסור שיופיעו הודעות "Claimed as …" או "open again" ישנות, או הודעת פקיעה שגויה
-  באף חלון;
-- פריסת כפתורי האימות בשני הרוחבים;
-- הודעות מגבלות ההדגמה בחלוניות *New order* ו־*Print files*;
-- עדכונים חיים בחלון השני, ופריסת 390 פיקסלים.
+- order creation and a status change;
+- two installers claiming at the same time, and verification;
+- claim expiry with the worker;
+- a simulated upload; the *Print files* dialog must fit at 390×844 and
+  768×1024 before, during and with a history of long file names;
+- an expired claim taken over by another installer who fails verification,
+  claims again, passes and completes, with no stale "Claimed as …" or "open
+  again" messages and no false expiry notice in either window;
+- the verification buttons' layout at both widths;
+- the demo-limit messages in the *New order* and *Print files* dialogs;
+- live updates in the other window and the 390 px layout.
 
-הבדיקה מפעילה `next start` משלה (פורט 3100) ו־worker מול `signflow_test`, ומוחקת
-רק את ההזמנות וההעלאות שיצרה.
+It starts its own `next start` (port 3100) and worker against
+`signflow_test`, and deletes only the orders and uploads it created.
 
-דרישות: Microsoft Edge או Google Chrome מותקן (או `UI_TEST_BROWSER` שמצביע על
-קובץ הרצה של דפדפן מבוסס Chromium), MongoDB פועל, סכמת הבדיקות מוחלת, ובניית
-ייצור:
+Prerequisites: Microsoft Edge or Google Chrome installed (or set
+`UI_TEST_BROWSER` to a Chromium-based browser executable), MongoDB running,
+the test schema applied, and a production build:
 
 ```powershell
 npm.cmd run db:up
 npm.cmd run db:push:test
 npm.cmd run build
-npm.cmd run test:ui            # כדקה; צילומי מסך ב־test-results/ui/ (מוחרג מ־Git)
+npm.cmd run test:ui            # about 1 minute; screenshots in test-results/ui/ (git-ignored)
 ```
 
-`UI_TEST_PORT` משנה את פורט האפליקציה אם 3100 תפוס. אין צורך בחבילות npm נוספות
-(הבדיקה משתמשת ב־`WebSocket` וב־`fetch` המובנים של Node).
+`UI_TEST_PORT` changes the app port if 3100 is taken. No extra npm packages
+are needed (it uses Node's built-in `WebSocket` and `fetch`).
 
-## תוצאות הבדיקות
+## Test Results
 
-התיעוד מבחין בין חמישה סוגי בדיקות. בדיקה שלא בוצעה אינה מוצגת כאילו עברה.
+The documentation distinguishes five kinds of checks. A check that was not
+performed is never reported as passed.
 
-### 1. בדיקות אוטומטיות (במאגר)
+### 1. Automated Tests (in the Repository)
 
-ההרצה המלאה האחרונה הייתה לפני ה־commit הראשון. שינויים שנוספו אחריה הם
-בתיעוד בלבד, ולכן לא הורצו מחדש.
+The last full run was before the first commit. Later changes were
+documentation only, so the tests were not run again.
 
-| בדיקה | תוצאה |
+| Check | Result |
 | --- | --- |
-| `npm run typecheck`, `npm run lint` | נקי |
-| `npm run build` | עובר, גם ללא מסד וללא `UPLOAD_SIGNING_SECRET` |
-| `npm test` (יחידה) | 87 מתוך 87 עברו |
-| `npm run test:integration` | 117 מתוך 117 עברו |
-| `npm run test:ui` (שני חלונות) | 23 מתוך 23 בדיקות עברו |
+| `npm run typecheck`, `npm run lint` | clean |
+| `npm run build` | passes, also without a database and without `UPLOAD_SIGNING_SECRET` |
+| `npm test` (unit) | 87 of 87 passed |
+| `npm run test:integration` | 117 of 117 passed |
+| `npm run test:ui` (two windows) | 23 of 23 checks passed |
 
-### 2. בדיקות אוטומטיות חד־פעמיות (סקריפטים זמניים, לא במאגר)
+### 2. One-Off Automated Checks (Temporary Scripts, Not in the Repository)
 
-- **אימות Docker סופי (16.11.2026, גרסת `main` ב־commit `3571ce7`):** ה־stack
-  של `signflow` נבנה מחדש ב־`docker compose -f docker-compose.yml -p signflow
-  --env-file .env up -d --build --wait`, בלי למחוק volumes. קובצי ה־worker
-  בקונטיינר זהים ל־`main` (השוואת SHA-256). הבדיקה הריצה דפדפן Edge ללא ממשק
-  וחיבור SSE ישיר מול `127.0.0.1:3080`, ו־**34 מתוך 34 בדיקות עברו**:
-  - יצירת הזמנה (`201`, `DRAFT`, version 0), קריאה ב־`GET /api/orders`, והופעה
-    בזרם ה־SSE ובדפדפן ללא רענון.
-  - שיוך ספק ומחזור הסטטוסים עד `READY_FOR_INSTALL`. `expectedVersion` ישן נדחה
-    ב־`409 VERSION_CONFLICT`, ומעבר לא חוקי ב־`400 INVALID_TRANSITION`.
-  - העלאה מדומה: הרשאה עם כתובת חתומה, השלמה ל־`COMPLETED`, וכתובת ששונתה
-    נדחתה ב־`403 UPLOAD_SIGNATURE_INVALID`. הסטטוס הגיע בזרם ה־SSE, ו־`GET
-    /api/orders` לא החזיר כתובת חתומה, `storageKey` או גיבוב אסימון.
-  - תפיסה בשם Jordan, ותפיסה שנייה בזמן שהראשונה פעילה נדחתה
-    ב־`409 CLAIM_UNAVAILABLE`.
-  - **ה־worker:** 186 שניות אחרי התפיסה (פקיעה ב־180 שניות ועוד מחזור סריקה)
-    התפיסה שוחררה במסד, בלוג ה־worker הופיע `released 1 expired claim(s)`, השחרור
-    הגיע בזרם ה־SSE, ואימות עם האסימון הישן נדחה ב־`409 CLAIM_NOT_ACTIVE`.
-  - **חידוש SSE:** השרת שלח `reconnect` וסגר את הזרם אחרי 279.9 שניות. הדפדפן
-    פתח זרם חדש 280 שניות אחרי הראשון, ונשאר **Live** לאורך כל 281 השניות שנדגמו.
-  - **עדכון אחרי החידוש:** Sam תפס ועבר אימות, ההזמנה עברה ל־`COMPLETED`, ונוצרה
-    הזמנה שנייה. הזרם החדש קיבל את השינויים, וההזמנה השנייה הופיעה בדפדפן.
-  - **ניקוי:** שתי ההזמנות וההעלאה של הבדיקה נמחקו לפי מזהה, וכך גם מונה
-    `demo_limits` שהבדיקה יצרה. שלוש ההזמנות ושש ההעלאות שהיו במסד לפני הבדיקה
-    לא נגעו.
-- **בדיקת Docker מוקדמת יותר:** בדיקה בשני חלונות דפדפן מול `127.0.0.1:3080`
-  עברה 20 מתוך 20. היא רצה על גרסה שקדמה למגבלות ההדגמה ולאורך החיים של זרם
-  ה־SSE.
-- **חידוש זרם ה־SSE:** חלון דפדפן אחד נשאר פתוח 5 דקות מול `next start` מקומי.
-  נרשמו שתי בקשות לזרם, בהפרש של 281 שניות, והחיווי נשאר **Live** כל הזמן.
-- **MongoDB Atlas:** חיבור, `prisma db push` ללא איפוס, יצירה ועדכון של הזמנה
-  דרך שירותי האפליקציה האמיתיים, קבלת אירוע change stream, ומחיקה לפי מזהה.
-- **אימג' ה־worker לפריסה:** נבנה מ־`Dockerfile#worker` עם ערכי build arguments
-  מדומים. הערכים לא הופיעו בתצורת האימג', בהיסטוריה או בקבצים. הקונטיינר עלה
-  ונעצר בצורה מסודרת.
+- **Final Docker check (16 Nov 2026, `main` at commit `3571ce7`):** the
+  `signflow` stack was rebuilt with `docker compose -f docker-compose.yml -p
+  signflow --env-file .env up -d --build --wait`, without deleting volumes.
+  The worker files in the container are identical to `main` (SHA-256
+  comparison). The check drove headless Edge and a direct SSE connection
+  against `127.0.0.1:3080`, and **34 of 34 checks passed**:
+  - order creation (`201`, `DRAFT`, version 0), read via `GET /api/orders`,
+    and arrival in the SSE stream and in the browser without a reload;
+  - vendor assignment and the status cycle up to `READY_FOR_INSTALL`; a stale
+    `expectedVersion` was rejected with `409 VERSION_CONFLICT`, and an invalid
+    transition with `400 INVALID_TRANSITION`;
+  - simulated upload: authorization with a signed URL, completion to
+    `COMPLETED`, and a modified URL rejected with
+    `403 UPLOAD_SIGNATURE_INVALID`; the status arrived in the SSE stream, and
+    `GET /api/orders` returned no signed URL, `storageKey` or token hash;
+  - a claim as Jordan; a second claim while the first was active was
+    rejected with `409 CLAIM_UNAVAILABLE`;
+  - **worker:** 186 s after the claim (expiry at 180 s plus one sweep) the
+    claim was released in the database, the worker log showed
+    `released 1 expired claim(s)`, the release arrived in the SSE stream, and
+    verification with the old token was rejected with
+    `409 CLAIM_NOT_ACTIVE`;
+  - **SSE renewal:** the server sent `reconnect` and ended the stream after
+    279.9 s; the browser opened a new stream 280 s after the first and stayed
+    **Live** for all 281 sampled seconds;
+  - **update after the renewal:** Sam claimed and passed verification, the
+    order moved to `COMPLETED`, and a second order was created; the new
+    stream received the changes, and the second order appeared in the
+    browser;
+  - **cleanup:** the check's two orders and one upload were deleted by id, as
+    was the `demo_limits` counter it created; the three orders and six
+    uploads that existed before were not touched.
+- **Earlier Docker check:** a two-window browser check against
+  `127.0.0.1:3080` passed 20 of 20. It ran on a version before the demo
+  limits and the SSE stream lifetime were added.
+- **SSE renewal:** one browser window stayed open for 5 minutes against a
+  local `next start`. Two stream requests were recorded, 281 s apart, and the
+  indicator stayed **Live** the whole time.
+- **MongoDB Atlas:** connection, `prisma db push` without a reset, creating
+  and updating an order through the real app services, receiving a change
+  stream event, and deletion by id.
+- **Worker image for the deployment:** built from `Dockerfile#worker` with
+  dummy build arguments. The values did not appear in the image config,
+  history or files. The container started and stopped gracefully.
 
-### 3. בדיקות ידניות מקומיות
+### 3. Manual Local Checks
 
-| רוחב | אוטומטי (`npm run test:ui`) | ידני (מצב רספונסיבי בדפדפן) |
+| Width | Automated (`npm run test:ui`) | Manual (browser responsive mode) |
 | --- | --- | --- |
-| 390×844 (טלפון) | כל התרחיש בשני חלונות, בחלון A, ללא גלילה אופקית בדף; כפתורי Installer assignment; חלונית *Print files* לפני ההעלאה, במהלכה ועם היסטוריה של שמות ארוכים | חלונית *Print files* בבניית ה־Docker: נמצאה גלישה אופקית, שתוקנה ונוספה לבדיקה האוטומטית. אחרי התיקון *Print files* נבדקה שוב ידנית ברוחב הזה |
-| 768×1024 (טאבלט) | חלונית *Print files* בלבד, באותם שלושה מצבים | לוח הבקרה והחלוניות *New order*, *Vendor*, *Change status*, *Installer assignment* (עם כפתורי האימות) ו־*Print files*. כולן נבדקו לפני תיקון הרוחב האחרון של *Print files* |
-| 1280×900 (מחשב) | כל התרחיש בשני חלונות, בחלון B; כפתורי Installer assignment | לא נבדק ידנית |
+| 390×844 (phone) | whole two-window flow in window A, no horizontal page overflow; Installer assignment buttons; *Print files* dialog before, during and with a history of long file names | *Print files* dialog on the Docker build: found a horizontal overflow, which was fixed and added to the automated check; after the fix, *Print files* was re-checked manually at this size |
+| 768×1024 (tablet) | *Print files* dialog only, in the same three states | dashboard and the *New order*, *Vendor*, *Change status*, *Installer assignment* (with the verification buttons) and *Print files* dialogs, all checked before the last *Print files* width fix |
+| 1280×900 (desktop) | whole two-window flow in window B; Installer assignment buttons | not checked manually |
 
-בנוסף הורצו ידנית תרחישי תפיסה בשני חלונות (פקיעה, מתקין אחר שלוקח את העבודה,
-אימות שנכשל ואימות שעבר, השלמה). הם חשפו הודעות תפיסה ישנות והודעת פקיעה
-שגויה, שהבדיקה האוטומטית מכסה כעת. גודלי החלונות בבדיקות האלה לא תועדו.
+Manual two-window claim flows (expiry, another installer taking over, failed
+and passed verification, completion) were also run. They found the stale
+claim messages and the false expiry notice that the automated check now
+covers. Their window sizes were not recorded.
 
-פער: ב־768 פיקסלים הבדיקה האוטומטית מודדת רק את חלונית *Print files*. לוח הבקרה
-ושאר החלוניות ברוחב טאבלט נבדקו ידנית לפני תיקון הרוחב האחרון של *Print files*,
-ולא נבדקו שוב ידנית מאז. התיקון עצמו מכוסה ב־768 פיקסלים בבדיקה האוטומטית של
-*Print files*.
+Gap: at 768 px the automated check measures only the *Print files* dialog.
+The dashboard and the other dialogs at tablet width were checked manually
+before the last *Print files* width fix and have not been re-checked manually
+since. The fix itself is covered at 768 px by the automated *Print files*
+check.
 
-### 4. בדיקה ידנית בענן
+### 4. Manual Cloud Check
 
-בוצעה בפריסת ה־Production ב־Vercel. התוצאות, כולל מה שלא נבדק, מפורטות
-ב־[docs/deployment.md](deployment.md).
+Performed on the Vercel production deployment. The results, including what
+was not checked, are in [docs/deployment.md](deployment.md#cloud-check-results).
 
-### 5. אימות הגדרות בלבד
+### 5. Configuration-Only Verification
 
-- `vercel.json` אומת מול הסכמה הרשמית (`https://openapi.vercel.sh/vercel.json`)
-  ונמצא תקין, כולל הגדרת ה־daemon. שבעה עותקים עם שגיאות מכוונות נדחו.
-- כלל ה־WAF ב־Vercel הוגדר, פורסם ונראה פעיל. הפעלת `429` בפועל לא נבדקה (ראו
-  [docs/deployment.md](deployment.md)).
+- `vercel.json` was validated against the official schema
+  (`https://openapi.vercel.sh/vercel.json`) and is valid, including the daemon
+  definition. Seven copies with deliberate errors were rejected.
+- The Vercel WAF rule was configured, published and shown as active. An
+  actual `429` was not triggered (see [docs/deployment.md](deployment.md#waf)).
 
-## תרחיש הדגמה מקומי
+## Local Demo Walkthrough
 
-הדגמה קצרה של התרחישים העיקריים (שרת פיתוח, שני חלונות דפדפן). לפני ההתחלה:
-`npm.cmd run db:up`, אחר כך `npm.cmd run dev`, ובטרמינל שני
-`npm.cmd run worker:claims`. פתחו את http://localhost:3000 **בשני חלונות** זה לצד
-זה. בהרצת Docker הכתובת היא http://127.0.0.1:3080, וה־worker כבר רץ.
+A short demo of the main flows (dev server, two browser windows). Before
+starting: `npm.cmd run db:up`, then `npm.cmd run dev` and, in a second
+terminal, `npm.cmd run worker:claims`. Open http://localhost:3000 in **two
+windows** side by side. In the Docker run the address is
+http://127.0.0.1:3080 and the worker is already running.
 
-1. **הזמנה וסטטוס:** בחלון 1 לחצו *New order* וצרו הזמנה. היא מופיעה מיד בחלון 2.
-   *Vendor*, בחירת ספק, *Save vendor*. *Change status*: *Submit order*, *Mark
-   vendor accepted*, *Start production*, *Mark ready for install*. (ללא ספק,
-   *Mark vendor accepted* מושבת, וה־API עונה `400 VENDOR_REQUIRED`.)
-2. **התנגשות בין שני מתקינים:** בחרו ב־*Acting as installer* מתקינים שונים בשני
-   החלונות. פתחו *Installer assignment* על ההזמנה בשני החלונות, ולחצו מהר
-   *Claim as …* בשניהם. חלון אחד מציג "Claimed as …" עם ספירה לאחור, והשני
-   "Another installer claimed this job first." שינוי סטטוס על גרסה ישנה מציג את
-   ההודעה "changed by someone else" ומרענן.
-3. **אימות:** בחלון שתפס לחצו *Simulate: verification passed* (או *failed*,
-   שמשחרר את העבודה מיד). החלון השני מציג "Installer: … · verified".
-4. **פקיעה:** תפסו הזמנה מוכנה אחרת ואל תעשו דבר. הספירה רצה מ־3:00, וב־0:00 שני
-   החלונות מציגים את העבודה כפתוחה שוב. החלון שתפס מציג "Your previous claim on …
-   expired before verification" (גם כשה־worker שחרר את התפיסה קודם). ה־worker
-   מאפס את התפיסה השמורה. עכשיו תפסו ואמתו בחלון השני: החלון הראשון מסיר את
-   ההודעה "Claimed as …" ומציג את השיוך החדש.
-5. **העלאה:** *Print files*, *Use a 1.5 GB demo print file*, *Start upload* (כ־16
-   שניות, מדומה). החלון השני מציג את הקובץ כהועלה. סמנו *Simulate a network
-   failure* או לחצו *Cancel upload* כדי לראות את מצבי הכשל והביטול ואת *Try
-   again*.
+1. **Order and status:** in window 1 click *New order* and create one; it
+   appears in window 2 immediately. *Vendor*, pick a vendor, *Save vendor*.
+   *Change status*: *Submit order*, *Mark vendor accepted*, *Start
+   production*, *Mark ready for install*. (Without a vendor, *Mark vendor
+   accepted* is disabled, and the API answers `400 VENDOR_REQUIRED`.)
+2. **Conflict between two installers:** set *Acting as installer* to
+   different people in the two windows. Open *Installer assignment* on the
+   order in both windows, then click *Claim as …* in both quickly. One window
+   shows "Claimed as …" with a countdown, the other "Another installer
+   claimed this job first." A status change on a stale version shows the
+   "changed by someone else" message and refreshes.
+3. **Verification:** in the claiming window use *Simulate: verification
+   passed* (or *failed*, which releases the job at once). The other window
+   shows "Installer: … · verified".
+4. **Expiry:** claim another ready order and do nothing. The countdown runs
+   from 3:00; at 0:00 both windows show the job as open again, and the
+   claiming window shows "Your previous claim on … expired before
+   verification" (also when the worker released the claim first). The worker
+   then resets the stored claim. Now claim and verify it in the other window:
+   the first window drops its "Claimed as …" message and shows the new
+   assignment.
+5. **Upload:** *Print files*, *Use a 1.5 GB demo print file*, *Start upload*
+   (about 16 s, simulated). The other window shows the file as uploaded. Tick
+   *Simulate a network failure* or press *Cancel upload* to see the failed
+   and cancelled states and *Try again*.
 
-אותם תרחישים רצים אוטומטית ב־`npm.cmd run test:ui`.
+The same flows run automatically with `npm.cmd run test:ui`.
 
-## גרסאות ותלויות
+## Versions and Dependencies
 
-| כלי | גרסה |
+| Tool | Version |
 | --- | --- |
 | Next.js (App Router) | 16.4.6 |
 | React / React DOM | 19.3.1 |
 | TypeScript (strict) | 5.9.3 |
 | Tailwind CSS | 4.3.5 |
-| רכיבי shadcn/ui | נוצרו עם shadcn CLI 4.23.0 (אינו תלות) |
+| shadcn/ui components | generated with the shadcn CLI 4.23.0 (not a dependency) |
 | ESLint | 9.39.x |
 | Prisma / @prisma/client | 6.19.3 |
-| דרייבר MongoDB ל־Node.js (`mongodb`) | 7.8.0 |
-| MongoDB (אימג' Docker) | 8.0.38 |
+| MongoDB Node.js driver (`mongodb`) | 7.8.0 |
+| MongoDB (Docker image) | 8.0.38 |
 | Zod | 4.6.7 |
 | Vitest / Vite | 5.1.0 / 8.3.8 |
 
-נימוקי הגרסאות:
+Notes on version choices:
 
-- **Prisma 6.19.3, לא 7 או 8:** ל־Prisma ORM 7 אין connector ל־MongoDB, ומדריך
-  השדרוג הרשמי ממליץ להישאר על Prisma ORM 6 עבור MongoDB. Prisma 8 תומך
-  ב־MongoDB אבל עדיין release candidate. 6.19.3 היא הגרסה היציבה החדשה ביותר
-  עם תמיכה ב־MongoDB. `prisma` ו־`@prisma/client` נעולים לאותה גרסה מדויקת.
-- **MongoDB 8.0.38:** עדכון התיקונים האחרון בקו 8.0. Prisma 6 תומך ב־MongoDB 4.2
-  ומעלה (נדרש replica set). לוגיקת התפיסה משתמשת ב־`$dateAdd` (MongoDB 5.0 ומעלה).
-- **TypeScript 5.9.3, לא 7.x:** `typescript-eslint` (בשימוש של
-  `eslint-config-next`) תומך ב־`typescript >=4.8.4 <6.1.0`. Next.js 16 ו־Prisma 6
-  דורשים TypeScript 5.1 ומעלה.
-- **ESLint 9, לא 10:** `eslint-plugin-react`, `eslint-plugin-import`
-  ו־`eslint-plugin-jsx-a11y` (בשימוש של `eslint-config-next`) מצהירים על תמיכה
-  עד ESLint 9. גם התבנית הרשמית של Next.js 16.4.6 משתמשת ב־ESLint 9.
-- **`mongodb` 7.8.0:** הדרייבר הרשמי ל־Node.js, בשימוש רק עבור Change Streams
-  (Prisma 6 אינו חושף אותם). Next.js מתייחס אליו כחבילה חיצונית לשרת (לא
-  נארזת). Prisma ממשיך לבצע את כל הקריאות והכתיבות.
-- **Zod 4.6.7:** הגרסה שכבר הייתה ב־lockfile (תלות עקיפה), וכעת מוצהרת ישירות.
-- **Vitest 5.1.0:** צריך את `vite` כתלות peer, נעול ל־8.3.8.
-- Tailwind CSS v4 מחובר דרך `@tailwindcss/turbopack` (כפי ש־`create-next-app`
-  יצר), ולכן אין `tailwind.config` ואין תצורת PostCSS.
-- **shadcn/ui:** הרכיבים ב־`src/components/ui` הם קובצי מקור. בזמן ריצה הם צריכים
-  רק את `radix-ui`, `cn`, `class-variance-authority`, `lucide-react`
-  ו־`tw-animate-css`. הקובץ היחיד שהם השתמשו בו מחבילת ה־CLI `shadcn` (ה־variants
-  של Tailwind, ברישיון MIT) הועתק לפרויקט כ־`src/app/shadcn-tailwind.css`, כך
-  שה־CLI ועץ התלויות הגדול שלו אינם מותקנים. להוספת רכיבים בעתיד:
+- **Prisma 6.19.3, not 7 or 8:** Prisma ORM 7 has no MongoDB connector, and
+  the official upgrade guide says to stay on Prisma ORM 6 for MongoDB.
+  Prisma 8 supports MongoDB but is still a release candidate. 6.19.3 is the
+  newest stable release with MongoDB support. `prisma` and `@prisma/client`
+  are pinned to the same exact version.
+- **MongoDB 8.0.38:** the latest patch of the 8.0 line. Prisma 6 supports
+  MongoDB 4.2+ (replica set required). The claim logic uses `$dateAdd`
+  (MongoDB 5.0+).
+- **TypeScript 5.9.3, not 7.x:** `typescript-eslint` (used by
+  `eslint-config-next`) supports `typescript >=4.8.4 <6.1.0`. Next.js 16 and
+  Prisma 6 require TypeScript 5.1+.
+- **ESLint 9, not 10:** `eslint-plugin-react`, `eslint-plugin-import` and
+  `eslint-plugin-jsx-a11y` (used by `eslint-config-next`) declare peer
+  support up to ESLint 9. The official Next.js 16.4.6 template also uses
+  ESLint 9.
+- **`mongodb` 7.8.0:** the official Node.js driver, used only for Change
+  Streams (Prisma 6 does not expose them). Next.js treats it as a
+  server-external package (not bundled). Prisma keeps doing all reads and
+  writes.
+- **Zod 4.6.7:** the version already present in the lockfile (transitive
+  dependency), now declared directly.
+- **Vitest 5.1.0:** needs `vite` as a peer dependency, pinned to 8.3.8.
+- Tailwind CSS v4 is wired through `@tailwindcss/turbopack` (as generated by
+  `create-next-app`), so there is no `tailwind.config` or PostCSS config.
+- **shadcn/ui:** the components in `src/components/ui` are source files; at
+  run time they need only `radix-ui`, `cn`, `class-variance-authority`,
+  `lucide-react` and `tw-animate-css`. The one file they used from the
+  `shadcn` CLI package (its Tailwind variants, MIT) is vendored as
+  `src/app/shadcn-tailwind.css`, so the CLI and its large dependency tree are
+  not installed. To add components later, run
   `npx.cmd shadcn@4.23.0 add <name>`.
-- `next.config.ts`: `cacheComponents` (ברירת המחדל ב־Next.js 16; נתיבי ה־API קוראים
-  ל־`connection()`, והדף הוא מעטפת סטטית) ו־`partialPrefetching` (Next 16.4 מזהיר
-  בלעדיו לצד `cacheComponents`; הוא משפיע רק על `<Link>`, שהדף היחיד אינו
-  משתמש בו), ובנוסף טוען ה־Turbopack של Tailwind.
-- `tsconfig.json` מפעיל את `allowImportingTsExtensions` (מותר בזכות `noEmit`).
-  מודולים שה־worker טוען ישירות עם Node (`src/lib/claims/store.mts`,
-  `constants.mts`) הם קובצי `.mts` שמיובאים עם הסיומת.
+- `next.config.ts`: `cacheComponents` (the Next.js 16 default; API routes
+  call `connection()`, and the page is a static shell) and
+  `partialPrefetching` (Next 16.4 warns without it next to `cacheComponents`;
+  it only affects `<Link>`, which this single page does not use), plus the
+  Tailwind Turbopack loader.
+- `tsconfig.json` enables `allowImportingTsExtensions` (allowed because of
+  `noEmit`). Modules that the worker loads directly with Node
+  (`src/lib/claims/store.mts`, `constants.mts`) are `.mts` files imported
+  with their extension.
 
 ### `npm audit`
 
-הבדיקה האחרונה: 10 ממצאים (3 high, 7 moderate; ה־CLI של `shadcn` ו־5 הממצאים שלו
-הוסרו). אף אחד מהם אינו בקוד שאפליקציית האינטרנט או ה־worker טוענים בזמן ריצה:
+Last checked: 10 findings (3 high, 7 moderate; the `shadcn` CLI and its 5
+findings were removed). None is in code that the running web app or worker
+loads:
 
-| ממצא | מגיע דרך | סוג | מצב |
+| Finding | Pulled in by | Kind | Status |
 | --- | --- | --- | --- |
-| `deepmerge-ts` < 8 (high, GHSA-ggr8-5vv4-36mx) דרך `@prisma/config` ו־`prisma` | ה־CLI של `prisma` 6.19.3 (`generate`, `db push`) | CLI. מופיע גם תחת `--omit=dev`, כי `@prisma/client` מצהיר על `prisma` כ־peer אופציונלי, אבל ה־runtime של הלקוח אינו טוען את `@prisma/config` | התיקון היחיד הוא Prisma 7, שאין לו connector ל־MongoDB, ולכן הממצא מתקבל. ה־CLI ממזג רק את התצורה של הפרויקט עצמו |
-| `minimatch` 10.x (moderate, GHSA-g3hv-75wg-m249) דרך חבילות `typescript-eslint` | `eslint-config-next` | פיתוח (lint) | `minimatch` 11 המתוקן מחוץ לטווח `^10` של `typescript-eslint`. `npm audit fix --dry-run` אינו משנה דבר. אין override ללא הוכחת תאימות |
+| `deepmerge-ts` < 8 (high, GHSA-ggr8-5vv4-36mx) via `@prisma/config` and `prisma` | the `prisma` 6.19.3 CLI (`generate`, `db push`) | CLI. Listed under `--omit=dev` too, because `@prisma/client` declares `prisma` as an optional peer, but the client runtime does not load `@prisma/config` | the only fix is Prisma 7, which has no MongoDB connector, so it is accepted; the CLI only merges this project's own config |
+| `minimatch` 10.x (moderate, GHSA-g3hv-75wg-m249) via `typescript-eslint` packages | `eslint-config-next` | dev (lint) | the fixed `minimatch` 11 is outside `typescript-eslint`'s `^10` range; `npm audit fix --dry-run` changes nothing; no override without proof of compatibility |
 
-לתלויות הריצה (`next`, `react`, `@prisma/client`, `mongodb`, `zod`, `radix-ui`,
-`lucide-react`, `cn`, `class-variance-authority`, `tw-animate-css`, `server-only`)
-אין ממצאים מדווחים.
+Runtime dependencies (`next`, `react`, `@prisma/client`, `mongodb`, `zod`,
+`radix-ui`, `lucide-react`, `cn`, `class-variance-authority`,
+`tw-animate-css`, `server-only`) have no reported findings.
 
-באימג'ים של Docker: האימג'ים `app` ו־`worker` אינם מכילים את Prisma CLI או את כלי
-ה־lint, ולכן אף אחד מהממצאים אינו קיים בהם. האימג' החד־פעמי `schema` מכיל את עץ
-התלויות המלא (הוא צריך את Prisma CLI). `npm ci` בבניית האימג' מדפיס הודעת
-deprecation עבור ESLint 9. זה כלי פיתוח, והוא אינו באימג'י הריצה.
+In the Docker images: the `app` and `worker` images contain neither the
+Prisma CLI nor the lint toolchain, so none of the findings above is present
+there. The one-shot `schema` image contains the full dependency tree (it
+needs the Prisma CLI). `npm ci` in the image build prints a deprecation
+notice for ESLint 9; it is a dev tool and not in the runtime images.
 
-## מבנה הפרויקט
+## Project Structure
 
 ```
 src/
   app/
-    page.tsx                 דף לוח הבקרה (מעטפת סטטית)
-    api/orders/              רשימה ויצירה, סטטוס, ספק, תפיסה, אימות,
-                             העלאות (הרשאה, השלמה, ביטול), events (SSE)
-    shadcn-tailwind.css      variants של Tailwind מ־shadcn (MIT)
+    page.tsx                 dashboard page (static shell)
+    api/orders/              list/create, status, vendor, claim, verification,
+                             uploads (authorize/complete/abort), events (SSE)
+    shadcn-tailwind.css      vendored Tailwind variants from shadcn (MIT)
   components/
-    orders/                  לוח הבקרה, החלוניות (יצירה, סטטוס, ספק, שיוך מתקין),
-                             תקציר תפיסה, hooks לנתונים חיים
-    uploads/                 חלונית קבצי ההדפסה, תקציר העלאות, hook לניהול העלאות
-    ui/                      רכיבי shadcn/ui
+    orders/                  dashboard, dialogs (create, status, vendor, installer
+                             assignment), claim summary, live-data hooks
+    uploads/                 print files dialog, upload summary, upload manager hook
+    ui/                      shadcn/ui components
   lib/
-    orders/                  כללי סטטוס, סכמות, שירות, מיזוג, לקוח API
-    claims/                  מודל התפיסה, מתקיני דמו, סכמות, שירות,
-                             store.mts (כתיבות מותנות ולולאת ה־worker), constants.mts
-    uploads/                 מגבלות, סכמות, חתימה (שרת), שירות (שרת),
-                             מתאם אחסון מדומה (דפדפן)
-    realtime/                feed של change stream, תשובת SSE
-    vendors/                 ספקי דמו וכללי ספקים
-    api/http.ts              עזרי תשובות JSON ושגיאות
-    demo-limits.mts          מגבלות נתוני ההדגמה (הזמנות, ניסיונות העלאה להזמנה)
-    prisma.ts                לקוח Prisma משותף (server-only)
-prisma/                      סכמת Prisma
-scripts/                     ה־worker, החלת סכמה על מסד הבדיקות, בדיקות מסד
+    orders/                  status rules, schemas, service, merge, API client
+    claims/                  claim model, demo installers, schemas, service,
+                             store.mts (conditional writes + worker loop), constants.mts
+    uploads/                 limits, schemas, signing (server), service (server),
+                             simulated storage adapter (browser)
+    realtime/                change-stream order feed, SSE response
+    vendors/                 demo vendors and vendor rules
+    api/http.ts              JSON and error response helpers
+    demo-limits.mts          demo data limits (orders, upload attempts per order)
+    prisma.ts                shared Prisma client (server-only)
+prisma/                      Prisma schema
+scripts/                     expiry worker, test-DB push, DB smoke/persistence checks
 tests/
-  integration/               בדיקות API, ספקים, תפיסות, העלאות, מגבלות ו־SSE (מסד בדיקות בלבד)
-  ui/                        בדיקת ממשק בשני חלונות (npm run test:ui)
-  support/                   הגנת מסד הבדיקות
-docs/                        תיעוד (ארכיטקטורה, פיתוח ובדיקות, פריסה)
-docker/mongodb/              אתחול ו־healthcheck של ה־replica set
-Dockerfile                   אימג'ים רב־שלביים: app, worker, schema
-docker-compose.yml           הרצה מלאה ב־Docker (MongoDB, schema, app, worker)
-compose.dev.yaml             MongoDB לפיתוח מקומי ב־Windows
-.dockerignore                מחריג סודות ותוצרי בנייה מהקשר הבנייה
-.vercelignore                מחריג קובצי סביבה, מפתחות, docs ותוצרי בדיקות מהעלאות ל־Vercel
-vercel.json                  Vercel: אזור הפונקציות וה־daemon של ה־worker
+  integration/               API, vendors, claims, uploads, demo limits and SSE tests (test database only)
+  ui/                        two-window UI check (npm run test:ui)
+  support/                   test-database guard
+docs/                        documentation (architecture, development and testing, deployment)
+docker/mongodb/              replica set init / healthcheck script
+Dockerfile                   multi-stage images: app, worker, schema
+docker-compose.yml           full Docker run (MongoDB, schema, app, worker)
+compose.dev.yaml             MongoDB for local Windows development
+.dockerignore                keeps secrets and build output out of the build context
+.vercelignore                keeps env files, keys, docs and test output out of Vercel uploads
+vercel.json                  Vercel: function region and the claim-expiry worker daemon
 ```
