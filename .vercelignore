@@ -10,7 +10,8 @@
 *.pem
 *.key
 
-# Task specification (kept locally only).
+# Documentation (in Git, not needed at run time) and the task specification
+# (kept locally only).
 docs/
 
 # Test results, local build output and dependencies (rebuilt on Vercel).
