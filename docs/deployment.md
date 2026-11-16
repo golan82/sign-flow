@@ -14,6 +14,7 @@
 | פונקציות | אזור `iad1` (Washington, D.C.) |
 | ה־worker לפקיעת תפיסות | Vercel Daemon (בטא) בשם `worker`, מופע אחד ב־`iad1`, 1 GiB |
 | מסד | אשכול MongoDB Atlas Free, מסד `signflow`, משתמש ייעודי `signflow_app` עם `readWrite` על `signflow` בלבד |
+| חיבור GitHub | לאפליקציית GitHub של Vercel יש גישה למאגר `sign-flow` בלבד (אומת ידנית) |
 | הגנת גישה | Vercel Authentication, כולל דומיין ה־Production. הבודק נכנס דרך קישור שיתוף שנמסר בנפרד |
 | WAF | כלל Rate Limit פעיל על כתיבות ל־`/api/orders` (ראו [WAF](#waf)) |
 
@@ -89,7 +90,8 @@
   יוצרת, ולכן לא נעשה בה שימוש).
 - גישת רשת: נדרש `0.0.0.0/0`, כי לפונקציות של Vercel אין כתובות IP קבועות.
   הסיסמה ו־TLS הם אז המחסום היחיד, ולכן המשתמש מוגבל ל־`signflow`.
-- מומלץ להפעיל MFA בחשבון Atlas. `TEST_DATABASE_URL` לעולם אינו מצביע על Atlas.
+- MFA בחשבון Atlas: מומלץ, אבל **עדיין לא אומת**. `TEST_DATABASE_URL` לעולם
+  אינו מצביע על Atlas.
 - האינדקסים נוצרו פעם אחת ב־`prisma db push`, עם `DATABASE_URL` שהוגדר רק
   לפקודה הזו (מ־`.env.atlas.local`, ולא נכתב ל־`.env`).
 - מגבלות המסלול החינמי: 512 MB, 500 חיבורים, 100 פעולות לשנייה, ו־10 GB נכנס
@@ -119,7 +121,8 @@
   (Shareable Link) של החשבון. Password Protection אינה זמינה ב־Hobby.
 - בבדיקת הענן, גישה דרך קישור השיתוף אפשרה גם את בקשות ה־API וה־SSE של הדף (ראו
   [תוצאות בדיקת הענן](#תוצאות-בדיקת-הענן)).
-- מומלץ לתת לאפליקציית GitHub של Vercel גישה למאגר הזה בלבד. הפריסה נעשית מ־Git. אם
+- הגישה של אפליקציית GitHub של Vercel הוגבלה למאגר `sign-flow` בלבד, ואומתה
+  ידנית. הפריסה נעשית מ־Git. אם
   פורסים עם ה־CLI, רק יחד עם `.vercelignore` (ה־CLI מעלה קבצים ש־`.gitignore`
   מחריג, כולל `.env`).
 
